@@ -24,7 +24,12 @@ from .enums import (
     UnresolvedStatus,
     WorkbookTab,
 )
-from .extractor import EXTRACTOR_VERSION_PREFIXES
+from .extractor import (
+    EXTRACTOR_VERSION_PREFIXES,
+    GOLD_EXTRACTOR_PREFIX,
+    HUMAN_EXTRACTOR_PREFIX,
+    WEB_EXTRACTOR_PREFIX,
+)
 from .field import (
     CONDITION_DIMENSION_NAMES,
     CanonicalField,
@@ -39,12 +44,25 @@ from .field import (
     VocabularyError,
 )
 from .principal import PrincipalContext
+from .sql_freeze import (
+    CLAIM_HUMAN_RESOLUTION_CHECK,
+    CLAIM_HUMAN_RESOLUTION_CONSTRAINT,
+    RUN_EVENT_TYPES,
+    SQL_RESERVED_FILES,
+)
 from .table import CellSpan, TableData
 
 __all__ = [
     "CATEGORY_TO_TAB",
+    "CLAIM_HUMAN_RESOLUTION_CHECK",
+    "CLAIM_HUMAN_RESOLUTION_CONSTRAINT",
     "CONDITION_DIMENSION_NAMES",
     "EXTRACTOR_VERSION_PREFIXES",
+    "GOLD_EXTRACTOR_PREFIX",
+    "HUMAN_EXTRACTOR_PREFIX",
+    "RUN_EVENT_TYPES",
+    "SQL_RESERVED_FILES",
+    "WEB_EXTRACTOR_PREFIX",
     "CanonicalField",
     "CellFlag",
     "CellSpan",

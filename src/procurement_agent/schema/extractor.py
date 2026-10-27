@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
-__all__ = ["EXTRACTOR_VERSION_PREFIXES"]
+__all__ = [
+    "EXTRACTOR_VERSION_PREFIXES",
+    "GOLD_EXTRACTOR_PREFIX",
+    "HUMAN_EXTRACTOR_PREFIX",
+    "WEB_EXTRACTOR_PREFIX",
+]
 
+
+HUMAN_EXTRACTOR_PREFIX = "human:"
+WEB_EXTRACTOR_PREFIX = "web:"
+GOLD_EXTRACTOR_PREFIX = "gold:"
 
 EXTRACTOR_VERSION_PREFIXES: tuple[str, str, str, str] = (
     "<pipeline>@<semver-or-hash>",
-    "human:<oidc-sub>",
-    "web:<provider>@<version>",
-    "gold:<annotator>",
+    f"{HUMAN_EXTRACTOR_PREFIX}<oidc-sub>",
+    f"{WEB_EXTRACTOR_PREFIX}<provider>@<version>",
+    f"{GOLD_EXTRACTOR_PREFIX}<annotator>",
 )
 """The four legal shapes of `FieldClaim.extractor_version`.
 

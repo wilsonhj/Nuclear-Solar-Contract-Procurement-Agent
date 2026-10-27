@@ -47,6 +47,7 @@ __all__ = [
     "VectorStorePort",
     "WebHit",
     "WebSearchPort",
+    "WebSearchRateLimitExceeded",
 ]
 
 
@@ -248,8 +249,18 @@ class WebHit:
             )
 
 
+class WebSearchRateLimitExceeded(RuntimeError):
+    """The web-search adapter refused a query because its quota is exhausted."""
+
+
 @runtime_checkable
 class WebSearchPort(Protocol):
     """Gap-triggered web search (P2-C4). Returns hits, not snippets or ranks."""
 
-    def search(self, query: str, *, limit: int) -> list[WebHit]: ...
+    def search(self, query: str, *, limit: int) -> list[WebHit]:
+        """Return matches; raise WebSearchRateLimitExceeded on quota exhaustion.
+
+        An empty list means no matches, never a rate-limit refusal. Other
+        adapter failures propagate separately from quota exhaustion.
+        """
+        ...

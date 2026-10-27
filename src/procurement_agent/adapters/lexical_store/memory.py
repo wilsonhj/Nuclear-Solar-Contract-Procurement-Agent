@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from ...ports import LexicalSearchPort, RetrievedChunk
 from ...schema import ComponentCategory, SourceTier
+from ..limits import require_non_negative_limit
 
 __all__ = ["InMemoryLexicalStore", "StoredLexicalChunk"]
 
@@ -82,6 +83,7 @@ class InMemoryLexicalStore:
         source_tier: SourceTier | None = None,
         allowed_document_ids: set[str] | None = None,
     ) -> list[RetrievedChunk]:
+        require_non_negative_limit(limit)
         hits = [
             StoredLexicalChunk(
                 chunk_id=chunk_id,

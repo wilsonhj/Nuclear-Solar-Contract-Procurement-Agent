@@ -85,12 +85,13 @@ from .capabilities import (
     not_applicable,
     unimplemented,
 )
-from .parsed_element import PARSED_ELEMENT_KINDS, TextElement
+from .parsed_element import PARSED_ELEMENT_KINDS, PARSED_ELEMENT_ROLES, TextElement
 from .registry import REGISTERED_ADAPTERS, adapters_for
 
 __all__ = [
     "CAPABILITIES_BY_PORT",
     "PARSED_ELEMENT_KINDS",
+    "PARSED_ELEMENT_ROLES",
     "REGISTERED_ADAPTERS",
     "UNXFAILABLE",
     "AbsenceKind",

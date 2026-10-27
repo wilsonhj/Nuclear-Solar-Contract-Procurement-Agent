@@ -14,7 +14,7 @@ from typing import Literal
 from ..ports import ParsedElement
 from ..schema import TableData
 
-__all__ = ["PARSED_ELEMENT_KINDS", "TextElement"]
+__all__ = ["PARSED_ELEMENT_KINDS", "PARSED_ELEMENT_ROLES", "TextElement"]
 
 
 PARSED_ELEMENT_KINDS: frozenset[str] = frozenset({"heading", "body", "table", "figure"})
@@ -26,6 +26,9 @@ Protocol cannot express a closed vocabulary over a `str`, so an adapter emitting
 consumer that switches on the value. `_assert_element_shape` in the contract
 suite is what holds adapters to it meanwhile.
 """
+
+PARSED_ELEMENT_ROLES: frozenset[str] = frozenset({"body", "furniture", "footnote", "caption"})
+"""The `role` vocabulary. A Protocol `Literal` is not enforced at runtime."""
 
 
 @dataclass
@@ -48,6 +51,12 @@ class TextElement:
     table: TableData | None = None
     page_quality: float | None = None
     role: Literal["body", "furniture", "footnote", "caption"] = "body"
+
+    def __post_init__(self) -> None:
+        if self.role not in PARSED_ELEMENT_ROLES:
+            raise ValueError(f"role {self.role!r} is outside {sorted(PARSED_ELEMENT_ROLES)}")
+        if (self.kind == "table") != (self.table is not None):
+            raise ValueError("ParsedElement.table is present iff kind == 'table'")
 
 
 def _conforms(element: TextElement) -> ParsedElement:

@@ -22,6 +22,7 @@ from typing import Any, cast
 
 from ...ports import RetrievedChunk, VectorStorePort
 from ...schema import ComponentCategory, SourceTier
+from ..limits import require_non_negative_limit
 from . import ChunkMetadata
 
 __all__ = ["InMemoryVectorStore", "StoredChunk"]
@@ -120,6 +121,7 @@ class InMemoryVectorStore:
         `allowed_document_ids=None` returns nothing. Omitting the allow-list is
         a forgotten entitlement (NFR-03 / AC-8), not authorised-for-all.
         """
+        require_non_negative_limit(limit)
         hits = [
             StoredChunk(
                 chunk_id=chunk_id,

@@ -48,6 +48,30 @@ Reserved numbers (files are **not** in this directory yet; 4a and 7 write them):
 
 `15+` is unassigned. Track 0 does not write `sql/10`–`sql/14`.
 
+## Track 0 freeze
+
+Story 4 / 7 write the files; Track 0 freezes the shapes they must not drift from.
+These strings are the pin `tests/test_phase2_contracts.py` copies verbatim from
+`schema.sql_freeze`.
+
+Reserved filenames:
+
+- `10_claim_resolution_link.sql`
+- `11_audit_run_event.sql`
+- `12_audit_event_taxonomy.sql`
+- `13_access_denylist.sql`
+- `14_restricted_group.sql`
+
+`10_claim_resolution_link.sql` adds `claim.resolution_id` and CHECK constraint
+`claim_human_carries_resolution`:
+`(extractor_version LIKE 'human:%') = (resolution_id IS NOT NULL)`
+
+`11_audit_run_event.sql` introduces `audit.run_event` whose `event_type` values
+are `web_search`, `compose_override`, `run_started`, `run_finished`.
+
+`12_audit_event_taxonomy.sql` removes `web_search` from `audit.event` and
+drops `recorded_at`'s DEFAULT.
+
 Two shared helpers cross file boundaries: `02_document.sql` defines
 `public.document_is_restricted(text)`, the confidentiality derivation every table
 carrying a `document_id` keys on, and `05_conflict.sql` defines

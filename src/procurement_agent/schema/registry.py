@@ -136,7 +136,7 @@ class FieldSpec(BaseModel):
     happened to `insulation_type`.
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     key: str
     shape: Shape

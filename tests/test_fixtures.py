@@ -409,6 +409,10 @@ def test_synthetic_pv_datasheet_chunks_are_the_triple_index() -> None:
     table_ids = {record.table_id for record in records if record.kind != "prose"}
     assert table_ids == {"table-electrical"}
     assert all(record.document_id == "synthetic-pv-datasheet" for record in records)
+    assert all(record.text == record.context_prefix + record.body for record in records)
+    parsed = _parsed("synthetic-pv-datasheet.json")
+    assert any(element.role == "furniture" for element in parsed)
+    assert all(record.section != "furniture" for record in records)
 
 
 def test_no_fixture_carries_a_resolution() -> None:

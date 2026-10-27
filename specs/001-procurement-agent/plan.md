@@ -558,17 +558,18 @@ autonomous-transaction trick — it re-introduces exactly the failure it is mean
 
 ---
 
-## Decision 10 — The six port Protocols are synchronous
+## Decision 10 — The eight port Protocols are synchronous
 
-**Chosen:** all six stay `def`, not `async def`. **Confidence: medium-high.** Recorded here so it
-stops being re-litigated.
+**Chosen:** all eight stay `def`, not `async def`. **Confidence: medium-high.** Recorded here so it
+stops being re-litigated. The original NFR-04 set was the first six; D-25 and P2-C4 added
+`LexicalSearchPort` and `WebSearchPort` without changing this decision's pattern.
 
 Concurrency in this system is **per-process, not per-coroutine**. Decision 1 makes the runner a
 Postgres job table with a `SELECT … FOR UPDATE SKIP LOCKED` worker loop — that pattern *is* the
 concurrency mechanism, and scaling it means more worker processes, which sidesteps the GIL
 entirely.
 
-Taking the six in turn:
+Taking each Protocol in turn:
 
 - **ParserPort, OCRPort** are CPU-bound in-process (Docling, TableFormer, tokenisation).
   Coroutines buy nothing; an async facade that immediately dispatches to a process pool is
@@ -577,12 +578,18 @@ Taking the six in turn:
   concurrent requests of 1 against a batching GPU server — the parallelism lives inside the
   payload, not at the call boundary.
 - **VectorStorePort** is a local Postgres round-trip under Decision 3a (exact search, no ANN).
-- **LLMPort** is the one genuinely I/O-bound port, and a `ThreadPoolExecutor` gives real overlap
+- **LexicalSearchPort** is the same local Postgres round-trip on the other retrieval leg
+  (tsvector / pg_trgm, Decision 3b / D-25). Async buys nothing a second connection in another
+  process does not already give.
+- **LLMPort** is one genuinely I/O-bound port, and a `ThreadPoolExecutor` gives real overlap
   because the GIL is released across socket reads.
+- **WebSearchPort** is the other I/O-bound port (D-26 / P2-C4): producer HTTP with a quota.
+  Same ThreadPool treatment as LLMPort; the rate limit lives in
+  `Settings.web_search_rate_limit_per_minute`, not in an async semaphore.
 
 Sync forecloses nothing: a caller can drive any of these concurrently without touching the
 interface, and because Protocols are **structural**, an `AsyncLLMPort` can be added *alongside*
-later — additive, not a breaking change across six interfaces.
+later — additive, not a breaking change across eight interfaces.
 
 The cost of the alternative is concrete. `async def` would propagate through
 `services/ingestion.ingest`, `indexing.index_document`, `retrieval.retrieve`, the worker loop and
@@ -596,8 +603,9 @@ Scale check: hundreds of documents, batch/offline, in-flight I/O concurrency in 
 Threads and coroutines are indistinguishable there; threads are simpler.
 
 **The real gap this decision exposes** is that there are no concurrency limits anywhere. Added to
-`config.Settings` as `max_concurrent_parse`, `max_concurrent_llm` and `web_search_rate_limit` —
-orthogonal to interface shape, and the thing actually worth specifying.
+`config.Settings` as `max_concurrent_parse`, `max_concurrent_llm` and
+`web_search_rate_limit_per_minute` — orthogonal to interface shape, and the thing actually worth
+specifying.
 
 ---
 

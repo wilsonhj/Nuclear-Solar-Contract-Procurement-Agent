@@ -8,6 +8,7 @@ conformance scan that forbids moving sources in a reference module.
 from __future__ import annotations
 
 from ...ports import WebHit, WebSearchPort
+from ..limits import require_non_negative_limit
 
 __all__ = ["InMemoryWebSearch"]
 
@@ -19,6 +20,7 @@ class InMemoryWebSearch:
         self._hits = {query: list(results) for query, results in (hits or {}).items()}
 
     def search(self, query: str, *, limit: int) -> list[WebHit]:
+        require_non_negative_limit(limit)
         return list(self._hits.get(query, [])[:limit])
 
 

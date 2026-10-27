@@ -101,7 +101,9 @@ class Capability(StrEnum):
       hyphen/space variants of the same part number (`JKM610N-66HL4M-V` ~
       `JKM610N 66HL4M V`).
     * `RATE_LIMITED` - a networked search backend honours a producer-side
-      quota. An in-memory fixture map has no quota to honour.
+      quota. Observable through `search()`: a burst beyond quota raises
+      `WebSearchRateLimitExceeded` (`test_a_burst_beyond_quota_is_refused`).
+      An in-memory fixture map has no quota to honour.
     """
 
     DETERMINISTIC_OUTPUT = "deterministic_output"

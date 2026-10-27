@@ -19,6 +19,7 @@ hold adapters whose dependencies are mutually exclusive.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from ..ports import (
@@ -29,6 +30,7 @@ from ..ports import (
     ParserPort,
     RerankerPort,
     VectorStorePort,
+    WebHit,
     WebSearchPort,
 )
 from .capabilities import AdapterEntry, Capability, not_applicable, unimplemented
@@ -78,10 +80,6 @@ _WEB_SEARCH_QUERY = "JKM610N-66HL4M-V"
 
 def _memory_web_search() -> InMemoryWebSearch:
     """Seed a fixture map. `datetime` stays here, not in the reference module."""
-    from datetime import UTC, datetime
-
-    from ..ports import WebHit
-
     when = datetime(2020, 1, 1, tzinfo=UTC)
     return InMemoryWebSearch(
         {

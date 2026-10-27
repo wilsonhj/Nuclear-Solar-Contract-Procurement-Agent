@@ -33,6 +33,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ...schema import (
+    HUMAN_EXTRACTOR_PREFIX,
     CanonicalField,
     ComponentCategory,
     Condition,
@@ -55,9 +56,10 @@ from ..conflict_hitl import (
 )
 
 #: The `extractor_version` prefix that marks a reviewer's decision recorded as a
-#: claim (D-16). `sql/06_resolution.sql` proposes `human:<resolved_by>`; the
-#: validator on `FieldClaim` is what makes the convention real.
-HUMAN_PREFIX = "human:"
+#: claim (D-16). One home: `schema.HUMAN_EXTRACTOR_PREFIX`. `sql/06_resolution.sql`
+#: proposes `human:<resolved_by>`; the validator on `FieldClaim` is what makes
+#: the convention real.
+HUMAN_PREFIX = HUMAN_EXTRACTOR_PREFIX
 
 
 class FieldClaim(BaseModel):
