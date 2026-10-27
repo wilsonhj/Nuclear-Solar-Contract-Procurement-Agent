@@ -584,8 +584,8 @@ Taking each Protocol in turn:
 - **LLMPort** is one genuinely I/O-bound port, and a `ThreadPoolExecutor` gives real overlap
   because the GIL is released across socket reads.
 - **WebSearchPort** is the other I/O-bound port (D-26 / P2-C4): producer HTTP with a quota.
-  Same ThreadPool treatment as LLMPort; the rate limit lives in `Settings.web_search_rate_limit`,
-  not in an async semaphore.
+  Same ThreadPool treatment as LLMPort; the rate limit lives in
+  `Settings.web_search_rate_limit_per_minute`, not in an async semaphore.
 
 Sync forecloses nothing: a caller can drive any of these concurrently without touching the
 interface, and because Protocols are **structural**, an `AsyncLLMPort` can be added *alongside*
@@ -603,8 +603,9 @@ Scale check: hundreds of documents, batch/offline, in-flight I/O concurrency in 
 Threads and coroutines are indistinguishable there; threads are simpler.
 
 **The real gap this decision exposes** is that there are no concurrency limits anywhere. Added to
-`config.Settings` as `max_concurrent_parse`, `max_concurrent_llm` and `web_search_rate_limit` —
-orthogonal to interface shape, and the thing actually worth specifying.
+`config.Settings` as `max_concurrent_parse`, `max_concurrent_llm` and
+`web_search_rate_limit_per_minute` — orthogonal to interface shape, and the thing actually worth
+specifying.
 
 ---
 

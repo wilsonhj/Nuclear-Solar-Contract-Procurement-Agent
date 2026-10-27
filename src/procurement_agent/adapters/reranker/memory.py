@@ -17,6 +17,7 @@ import re
 from dataclasses import replace
 
 from ...ports import RerankerPort, RetrievedChunk
+from ..limits import require_non_negative_limit
 from ..vector_store.memory import StoredChunk
 
 __all__ = ["InMemoryReranker"]
@@ -40,6 +41,7 @@ class InMemoryReranker:
 
         Ties break on `chunk_id`, for the reason the store's `search` gives.
         """
+        require_non_negative_limit(limit)
         wanted = set(_TOKEN.findall(query.lower()))
         rescored = [
             replace(_as_stored(chunk), score=_overlap(wanted, chunk.text)) for chunk in chunks

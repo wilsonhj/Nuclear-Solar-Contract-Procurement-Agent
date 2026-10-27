@@ -866,6 +866,13 @@ def test_reranking_returns_only_chunks_it_was_given(entry: AdapterEntry) -> None
 
 
 @pytest.mark.parametrize("entry", cases(RerankerPort))
+def test_reranking_rejects_a_negative_limit(entry: AdapterEntry) -> None:
+    """`rescored[:limit]` with limit=-1 drops the last candidate instead of refusing."""
+    with pytest.raises(ValueError, match="limit"):
+        _reranker(entry).rerank("rated ac power", _candidates(), limit=-1)
+
+
+@pytest.mark.parametrize("entry", cases(RerankerPort))
 def test_reranking_returns_no_more_than_the_limit(entry: AdapterEntry) -> None:
     """The limit is the context budget the LLM stage is sized against."""
     assert len(_reranker(entry).rerank("rated ac power", _candidates(), limit=2)) == 2

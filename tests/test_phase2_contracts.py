@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import inspect
 import pathlib
+import re
 from datetime import UTC, datetime
 from typing import Literal, get_args, get_origin, get_type_hints
 
@@ -19,6 +20,7 @@ from pydantic import ValidationError
 from procurement_agent.adapters.lexical_store.memory import InMemoryLexicalStore
 from procurement_agent.adapters.parsed_element import TextElement
 from procurement_agent.adapters.vector_store import ChunkMetadata
+from procurement_agent.config import Settings
 from procurement_agent.ports import ParsedElement, WebHit
 from procurement_agent.schema import (
     EXTRACTOR_VERSION_PREFIXES,
@@ -48,6 +50,39 @@ from procurement_agent.services import indexing
 from procurement_agent.services.claims import HUMAN_PREFIX
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
+
+# Spec order, not frozenset order. The README pin is this phrase, because each
+# token alone already occurs in the removal sentence or later in the file.
+_RUN_EVENT_ORDER = (
+    "web_search",
+    "compose_override",
+    "run_started",
+    "run_finished",
+)
+
+
+def _track0_freeze_section(readme: str) -> str:
+    """Text under the Track 0 heading, stopping at the next heading.
+
+    ``split(...)[1]`` is the rest of the file. Decision 6 still says
+    ``web_search``, so an unbounded slice does not pin the run_event list.
+    """
+    parts = readme.split("## Track 0 freeze", 1)
+    if len(parts) != 2:
+        raise AssertionError("sql/README.md must have a Track 0 freeze section")
+    body = parts[1]
+    next_heading = body.find("\n## ")
+    return body if next_heading < 0 else body[:next_heading]
+
+
+def _pins_run_event_list(section: str) -> bool:
+    """The four types in spec order, as one backticked list.
+
+    Each name on its own is not a pin: ``web_search`` is also the value
+    ``sql/12`` removes from ``audit.event``, and Decision 6 repeats it.
+    """
+    listed = ", ".join(f"`{name}`" for name in _RUN_EVENT_ORDER)
+    return listed in section
 
 
 def test_parsed_element_annotations_include_optional_bbox_table_page_quality_role() -> None:
@@ -189,9 +224,7 @@ def test_sql_readme_reserves_10_through_14() -> None:
     ``audit.event`` taxonomy.
     """
     readme = (REPO / "sql" / "README.md").read_text(encoding="utf-8")
-    parts = readme.split("## Track 0 freeze", 1)
-    assert len(parts) == 2, "sql/README.md must have a Track 0 freeze section"
-    freeze = parts[1]
+    freeze = _track0_freeze_section(readme)
     for name in SQL_RESERVED_FILES:
         assert name in freeze, f"sql/README.md does not reserve {name}"
     sql_dir = REPO / "sql"
@@ -199,9 +232,27 @@ def test_sql_readme_reserves_10_through_14() -> None:
     assert leaked == [], f"Track 0 must not write sql/10–14; found {leaked}"
     assert CLAIM_HUMAN_RESOLUTION_CONSTRAINT in freeze
     assert CLAIM_HUMAN_RESOLUTION_CHECK in freeze
-    for event_type in RUN_EVENT_TYPES:
-        assert event_type in freeze, f"sql/README.md does not freeze run_event type {event_type}"
+    assert set(_RUN_EVENT_ORDER) == set(RUN_EVENT_TYPES)
+    assert _pins_run_event_list(freeze), (
+        "the Track 0 section must list the run_event types as one phrase; "
+        "a later `web_search` or the removal sentence is not that list"
+    )
     assert "drops `recorded_at`'s DEFAULT" in freeze or "drops recorded_at's DEFAULT" in freeze
+
+
+def test_scattered_web_search_mentions_do_not_pin_the_run_event_list() -> None:
+    """Dropping ``web_search`` from the type list still left it in the removal sentence."""
+    decoy = """
+## Track 0 freeze
+
+`12_audit_event_taxonomy.sql` removes `web_search` from `audit.event` and
+mentions compose_override, run_started and run_finished in prose.
+
+## Later
+
+`web_search`, `compose_override`, `run_started`, `run_finished`
+"""
+    assert not _pins_run_event_list(_track0_freeze_section(decoy))
 
 
 def test_sql_apply_glob_is_two_digit() -> None:
@@ -294,6 +345,18 @@ def test_plan_decision_4_names_pypdfium2_and_libreoffice_for_word() -> None:
     assert "LibreOffice" in decision_4
     assert "raw PyMuPDF text count" not in decision_4
     assert "MSWord backend" not in decision_4 or "LibreOffice" in decision_4
+
+
+def test_decision_10_names_the_settings_field_that_exists() -> None:
+    """The quota knob is ``web_search_rate_limit_per_minute``. There is no shorter alias."""
+    plan = (REPO / "specs" / "001-procurement-agent" / "plan.md").read_text(encoding="utf-8")
+    start = plan.index("## Decision 10")
+    end = plan.index("\n## Revised dependency")
+    decision = plan[start:end]
+    assert "web_search_rate_limit_per_minute" in decision
+    assert re.search(r"web_search_rate_limit(?!_per_minute)", decision) is None
+    assert "web_search_rate_limit_per_minute" in Settings.model_fields
+    assert "web_search_rate_limit" not in Settings.model_fields
 
 
 def test_current_decision_10_count_files_do_not_claim_six() -> None:
