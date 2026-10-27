@@ -3,7 +3,7 @@
 This audit reflects the `claude/phase-1-integration` branch as verified on 2026-08-29. It
 answers the practical question a new contributor has first: what can the repository do today?
 
-The local verification baseline is **1000 passing, 42 skipped, and 4 expected failures**, plus a
+The local verification baseline is **1092 passing, 42 skipped, and 4 expected failures**, plus a
 clean Ruff check, a clean `ruff format --check`, and a clean strict-mypy check across `src/` and
 `tests/`. The skips are intentionally DSN-gated live tests: 32 in
 `tests/test_sql_behaviour.py` and 10 in `tests/test_audit_live.py`. With
@@ -141,6 +141,20 @@ service-owned transaction, rolling back all of them on failure.
 This does not implement general CSV intake, native PDF/Word/Excel parsing, OCR, a general
 PostgreSQL repository, a reviewer API/UI, or the stage runner. It is a narrow executable proof of
 the contracts, not a production ingestion route.
+
+### Timeouts and structured logging
+
+`config.Settings` carries an explicit wall-clock timeout for each external call
+(`parse`, `embed`, `llm`, `vector_store`, `web_search`) and a `stage_timeout_seconds` budget,
+validated to nest: every per-call timeout is at most the stage budget, and the stage budget is
+strictly inside the 15-minute job lease (D-12e, `config.JOB_LEASE_SECONDS`). The nesting is
+checked at construction and on assignment, and a refused assignment is rolled back.
+`logging_config.configure_logging()` installs a one-JSON-object-per-line handler on the package
+logger that masks `SecretStr` values (ADR-001 decisions 3 and 7).
+
+**Nothing consumes either yet.** No adapter implements a port and no module logs, so no timeout
+is enforced on a real call and no log line is emitted today; the settings and the handler are the
+contract the first adapter and the runner must use. Exception text is not redacted by the logger.
 
 ## Declared but not operational
 
