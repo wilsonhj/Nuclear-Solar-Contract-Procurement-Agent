@@ -9,10 +9,22 @@ see docs/open-questions.md.
 
 from __future__ import annotations
 
-from pydantic import Field, SecretStr
+from collections.abc import Mapping
+from typing import Any, Literal, Self
+
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .schema import Severity
+
+#: The `job` table's claim lease, in seconds: D-12e's 15 minutes, which `sql/08_job.sql`
+#: restates in a comment rather than a constraint. It is the OUTERMOST bound in this
+#: file - a worker whose stage outlives its lease is swept back to `pending` and
+#: re-run by a second worker while the first is still writing. `tests/test_settings_timeouts.py`
+#: reads D-12e so this cannot drift from the decision it mirrors.
+JOB_LEASE_SECONDS: float = 15 * 60.0
+
+LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 
 class Settings(BaseSettings):
@@ -117,6 +129,68 @@ class Settings(BaseSettings):
         default=30, ge=1, description="Cap on supplementary web queries (FR-WEB-01)"
     )
 
+    # --- Timeouts (ADR-001 decision 3) ---
+    # Every external call carries an explicit wall-clock bound; before this block
+    # nothing in code or spec had one, so a hung OCR engine or an unresponsive
+    # vLLM endpoint would hold a worker until the lease expired and a second worker
+    # re-ran the job under it.
+    #
+    # **Nothing reads these yet.** No concrete adapter exists for any port, so there
+    # is no call site to pass them to; the first adapter for each port must take its
+    # timeout from here rather than invent one. The values are starting points like
+    # every other default in this class, not spec values - D-12e fixes only the lease.
+    #
+    # The bounds nest: every per-call timeout <= `stage_timeout_seconds` < the job
+    # lease. A stage budget shorter than one call it contains could never finish
+    # that call, and a stage budget at or past the lease lets the sweeper re-queue
+    # a job that is still running. Both are rejected at construction and on
+    # assignment, because a violated nesting is a configuration error to raise at
+    # load, not a surprise to discover in a worker at 3 a.m.
+    parse_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="One document through ParserPort plus OCRPort (OCR is the slow path)",
+    )
+    embed_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="One batch through EmbedderPort or RerankerPort",
+    )
+    llm_timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="One LLMPort.extract call",
+    )
+    vector_store_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="One VectorStorePort query or upsert",
+    )
+    web_search_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="One supplementary web query (FR-WEB-01)",
+    )
+    stage_timeout_seconds: float = Field(
+        default=600.0,
+        gt=0,
+        allow_inf_nan=False,
+        description=(
+            "Wall-clock budget for one WHOLE job stage, retries and sequential calls "
+            "included. Must hold the slowest single call and stay strictly inside the "
+            "job lease; because it bounds the stage as a whole, the lease guarantee "
+            "does not depend on how many calls the stage makes."
+        ),
+    )
+
+    # --- Logging (ADR-001 decision 7) ---
+    log_level: LogLevel = "INFO"
+
     # --- Compose gate (issue #14) ---
     # Composition refuses to run while an unresolved conflict sits STRICTLY ABOVE
     # this level. MEDIUM means decision-driving specs may still be open, but a
@@ -135,6 +209,69 @@ class Settings(BaseSettings):
 
     # --- Output (FR-OUT-01) ---
     suppliers_as_rows: bool = True
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _log_level_is_case_insensitive(cls, value: object) -> object:
+        """An environment file says `info`; the stdlib's names are upper-case."""
+        return value.upper() if isinstance(value, str) else value
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Validate the whole configuration with this change applied, THEN commit it.
+
+        Pydantic applies a `validate_assignment` write and only then runs the model-level
+        validators, so a rejected cross-field write used to raise while leaving the rejected
+        value in place: `settings.stage_timeout_seconds = 901` raised, and the next read
+        returned 901. An earlier fix restored the old value afterwards, which left a window in
+        which another thread could read the bad one. Validating a candidate first means the
+        invalid value is never written at all. Field-level bounds (`compose_gate_threshold`'s
+        `le`) never had the problem; only a cross-field check does.
+
+        Because each assignment is checked against the OTHER fields' current values, moving
+        two coupled settings can be order-dependent (raise the stage budget before the call
+        timeout that needs it). To change them together use `model_copy(update={...})`, which
+        validates the combined result once.
+        """
+        if name in type(self).model_fields:
+            type(self).model_validate({**self.__dict__, name: value})
+        super().__setattr__(name, value)
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Copy, re-validating when `update` is given.
+
+        Stock `model_copy(update=...)` skips validation entirely, so it bypassed the
+        field bounds and the timeout nesting alike: `model_copy(update={"stage_timeout_seconds":
+        5000})` returned a stage budget far past the job lease without complaint. This is also
+        the supported way to change several coupled settings at once.
+        """
+        copied = super().model_copy(update=update, deep=deep)
+        if update:
+            return type(self).model_validate(copied.__dict__)
+        return copied
+
+    @model_validator(mode="after")
+    def _timeouts_nest(self) -> Settings:
+        """Per-call timeouts <= the stage budget < the job lease."""
+        # Derived, not listed: a sixth `*_timeout_seconds` field added later is covered
+        # without anyone remembering to edit this method.
+        calls = {
+            name: getattr(self, name)
+            for name in type(self).model_fields
+            if name.endswith("_timeout_seconds") and name != "stage_timeout_seconds"
+        }
+        slowest_name, slowest = max(calls.items(), key=lambda item: item[1])
+        if self.stage_timeout_seconds < slowest:
+            raise ValueError(
+                f"stage_timeout_seconds ({self.stage_timeout_seconds:g}s) is shorter than "
+                f"{slowest_name} ({slowest:g}s): the stage could never finish that call"
+            )
+        if self.stage_timeout_seconds >= JOB_LEASE_SECONDS:
+            raise ValueError(
+                f"stage_timeout_seconds ({self.stage_timeout_seconds:g}s) must be strictly "
+                f"inside the {JOB_LEASE_SECONDS:g}s job lease (D-12e), or the lease sweeper "
+                "re-queues a job that is still running"
+            )
+        return self
 
 
 def load_settings() -> Settings:
