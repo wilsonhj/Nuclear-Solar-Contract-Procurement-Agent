@@ -100,3 +100,61 @@ def test_the_log_level_accepts_an_environment_files_spelling() -> None:
     assert _settings(log_level="debug").log_level == "DEBUG"
     with pytest.raises(ValidationError):
         _settings(log_level="verbose")
+
+
+def test_model_copy_with_update_is_validated_like_construction() -> None:
+    """Stock `model_copy(update=...)` skips validation: it returned a 5000s stage budget and a
+    negative call timeout without complaint, bypassing the bounds and the nesting alike."""
+    settings = _settings()
+    with pytest.raises(ValidationError, match="job lease"):
+        settings.model_copy(update={"stage_timeout_seconds": 5000})
+    with pytest.raises(ValidationError):
+        settings.model_copy(update={"llm_timeout_seconds": -5})
+
+
+def test_model_copy_changes_coupled_settings_in_one_step() -> None:
+    """Assignment is order-dependent for coupled fields; the batch path is not."""
+    settings = _settings()
+    with pytest.raises(ValidationError):
+        settings.parse_timeout_seconds = 700  # stage is still 600
+    moved = settings.model_copy(update={"parse_timeout_seconds": 700, "stage_timeout_seconds": 800})
+    assert (moved.parse_timeout_seconds, moved.stage_timeout_seconds) == (700.0, 800.0)
+    assert settings.stage_timeout_seconds == 600.0  # the original is untouched
+
+
+def test_model_copy_without_update_is_unchanged() -> None:
+    settings = _settings(llm_timeout_seconds=90.0)
+    assert settings.model_copy().llm_timeout_seconds == 90.0
+
+
+def test_a_refused_assignment_never_writes_the_value() -> None:
+    """Validate-then-commit: the rejected value must not be observable even transiently,
+    which a write-then-restore cannot guarantee to a concurrent reader."""
+    settings = _settings()
+    seen: list[float] = []
+    original = Settings.__setattr__
+
+    # Record every value the instance actually holds at the moment validation runs.
+    def spying(self: Settings, name: str, value: Any) -> None:
+        try:
+            original(self, name, value)
+        finally:
+            seen.append(self.__dict__["stage_timeout_seconds"])
+
+    Settings.__setattr__ = spying  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ValidationError):
+            settings.stage_timeout_seconds = JOB_LEASE_SECONDS + 1
+    finally:
+        Settings.__setattr__ = original  # type: ignore[method-assign]
+    assert seen == [600.0]
+
+
+def test_a_timeout_field_added_later_is_covered_without_editing_the_validator() -> None:
+    """The call timeouts are derived from the field names, not hand-listed."""
+
+    class Extended(Settings):
+        speech_timeout_seconds: float = 700.0  # longer than the default 600s stage
+
+    with pytest.raises(ValidationError, match="speech_timeout_seconds"):
+        Extended(_env_file=None)  # type: ignore[call-arg]

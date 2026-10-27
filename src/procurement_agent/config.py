@@ -9,7 +9,8 @@ see docs/open-questions.md.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from collections.abc import Mapping
+from typing import Any, Literal, Self
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -216,36 +217,47 @@ class Settings(BaseSettings):
         return value.upper() if isinstance(value, str) else value
 
     def __setattr__(self, name: str, value: Any) -> None:
-        """Assign, and undo the assignment if the nesting check refuses it.
+        """Validate the whole configuration with this change applied, THEN commit it.
 
-        Pydantic applies a `validate_assignment` write and *then* runs the model-level
-        validators, so a rejected write raised while leaving the rejected value in
-        place: `settings.stage_timeout_seconds = 901` raised, and the next read returned
-        901. Field-level bounds such as `compose_gate_threshold`'s `le` run before the
-        write and were never exposed; only a cross-field check is. A refusal that does
-        not roll back is not an interlock.
+        Pydantic applies a `validate_assignment` write and only then runs the model-level
+        validators, so a rejected cross-field write used to raise while leaving the rejected
+        value in place: `settings.stage_timeout_seconds = 901` raised, and the next read
+        returned 901. An earlier fix restored the old value afterwards, which left a window in
+        which another thread could read the bad one. Validating a candidate first means the
+        invalid value is never written at all. Field-level bounds (`compose_gate_threshold`'s
+        `le`) never had the problem; only a cross-field check does.
+
+        Because each assignment is checked against the OTHER fields' current values, moving
+        two coupled settings can be order-dependent (raise the stage budget before the call
+        timeout that needs it). To change them together use `model_copy(update={...})`, which
+        validates the combined result once.
         """
-        missing = object()
-        previous = self.__dict__.get(name, missing)
-        fields_set = set(self.__pydantic_fields_set__)
-        try:
-            super().__setattr__(name, value)
-        except Exception:
-            if previous is not missing:
-                self.__dict__[name] = previous
-            self.__pydantic_fields_set__.clear()
-            self.__pydantic_fields_set__.update(fields_set)
-            raise
+        if name in type(self).model_fields:
+            type(self).model_validate({**self.__dict__, name: value})
+        super().__setattr__(name, value)
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Copy, re-validating when `update` is given.
+
+        Stock `model_copy(update=...)` skips validation entirely, so it bypassed the
+        field bounds and the timeout nesting alike: `model_copy(update={"stage_timeout_seconds":
+        5000})` returned a stage budget far past the job lease without complaint. This is also
+        the supported way to change several coupled settings at once.
+        """
+        copied = super().model_copy(update=update, deep=deep)
+        if update:
+            return type(self).model_validate(copied.__dict__)
+        return copied
 
     @model_validator(mode="after")
     def _timeouts_nest(self) -> Settings:
         """Per-call timeouts <= the stage budget < the job lease."""
+        # Derived, not listed: a sixth `*_timeout_seconds` field added later is covered
+        # without anyone remembering to edit this method.
         calls = {
-            "parse_timeout_seconds": self.parse_timeout_seconds,
-            "embed_timeout_seconds": self.embed_timeout_seconds,
-            "llm_timeout_seconds": self.llm_timeout_seconds,
-            "vector_store_timeout_seconds": self.vector_store_timeout_seconds,
-            "web_search_timeout_seconds": self.web_search_timeout_seconds,
+            name: getattr(self, name)
+            for name in type(self).model_fields
+            if name.endswith("_timeout_seconds") and name != "stage_timeout_seconds"
         }
         slowest_name, slowest = max(calls.items(), key=lambda item: item[1])
         if self.stage_timeout_seconds < slowest:

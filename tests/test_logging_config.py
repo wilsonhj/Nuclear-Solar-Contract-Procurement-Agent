@@ -3,12 +3,20 @@
 import io
 import json
 import logging
+import sys
 from collections.abc import Iterator
+from typing import get_args
 
 import pytest
 from pydantic import SecretStr
 
-from procurement_agent.logging_config import ROOT_LOGGER_NAME, configure_logging
+from procurement_agent.config import LogLevel
+from procurement_agent.logging_config import (
+    LEVELS,
+    ROOT_LOGGER_NAME,
+    _plain,
+    configure_logging,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -158,3 +166,36 @@ def test_an_unknown_level_leaves_the_existing_configuration_untouched() -> None:
     assert logger.level == logging.WARNING
     logging.getLogger("procurement_agent.test").warning("still routed")
     assert [r["message"] for r in _lines(stream)] == ["still routed"]
+
+
+def test_the_accepted_levels_are_exactly_the_settings_literal() -> None:
+    """Two spellings of one list drift; this pins them together."""
+    assert LEVELS == set(get_args(LogLevel))
+
+
+@pytest.mark.parametrize("level", ["notset", "NOTSET", "warn", "FATAL", "10", ""])
+def test_levels_outside_the_five_names_are_refused(level: str) -> None:
+    """NOTSET on a non-root logger silently inherits the ROOT logger's level, so the caller who
+    asked for everything would get the host application's WARNING."""
+    with pytest.raises(ValueError, match="unknown log level"):
+        configure_logging(level, io.StringIO())
+
+
+def test_the_default_stream_follows_sys_stderr_after_it_is_swapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handler used to bind the `sys.stderr` object present at configure time, so a later
+    swap or close (pytest capture, a daemonising wrapper) lost every subsequent record."""
+    first, second = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stderr", first)
+    configure_logging("INFO")
+    first.close()
+    monkeypatch.setattr(sys, "stderr", second)
+    logging.getLogger("procurement_agent.test").info("after the swap")
+    assert [r["message"] for r in _lines(second)] == ["after the swap"]
+
+
+def test_set_context_is_emitted_in_a_stable_order() -> None:
+    """String hashing is randomised per process, so raw set iteration order is not repeatable."""
+    assert _plain({"ccc", "aaa", "bbb", "ddd"}) == ["aaa", "bbb", "ccc", "ddd"]
+    assert _plain(frozenset({3, 1, 2})) == [1, 2, 3]

@@ -9,9 +9,11 @@ Two properties are deliberate rather than incidental:
 * **A `SecretStr` never renders.** Context arrives through `extra=`, and the
   encoder falls back to `str()`, which a `SecretStr` masks. `Settings` wraps the
   bearer tokens and DSNs for exactly this reason (`tests/test_settings_secrets.py`).
-* **Exception text is NOT redacted.** A traceback is rendered verbatim, so an
-  exception whose message embeds a credential or a DSN will log it. The rule is on the
-  raiser: do not put a secret in an exception message. This module cannot enforce it.
+* **Message text and exception text are NOT redacted.** Only `extra=` context is masked.
+  `log.error("db failed: %s", dsn)` writes the DSN, and a traceback is rendered verbatim, so
+  an exception whose message embeds a credential logs it too. The rule is on the caller:
+  pass secrets as `SecretStr` context, never interpolate them into a message or an
+  exception. This module cannot enforce it.
 
 This is a formatter and one configuration function. It is not an audit trail:
 `procurement_agent.audit` is the tamper-evident record, and nothing here substitutes for it.
@@ -39,6 +41,11 @@ _RECORD_FIELDS = frozenset(logging.LogRecord("", logging.INFO, "", 0, "", None, 
 }
 
 
+#: The names `configure_logging` accepts. `NOTSET` and the `WARN` alias are valid stdlib level
+#: names but wrong here: NOTSET on a non-root logger silently inherits the ROOT logger's level.
+#: `tests/test_logging_config.py` pins this against `config.LogLevel`.
+LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
 _CORE_KEYS = frozenset({"ts", "level", "logger", "message", "exc", "stack"})
 _MAX_DEPTH = 8
 
@@ -59,7 +66,11 @@ def _plain(value: object, depth: int = 0) -> object:
         return value if math.isfinite(value) else str(value)
     if isinstance(value, dict):
         return {str(k): _plain(v, depth + 1) for k, v in value.items()}
-    if isinstance(value, list | tuple | set | frozenset):
+    if isinstance(value, set | frozenset):
+        # Sorted: string hashing is randomised per process, so set order is not stable
+        # between runs and a line that is meant to be diffable would not be.
+        return [_plain(v, depth + 1) for v in sorted(value, key=repr)]
+    if isinstance(value, list | tuple):
         return [_plain(v, depth + 1) for v in value]
     return str(value)  # a SecretStr renders as its mask
 
@@ -85,6 +96,22 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False, default=str)
 
 
+class _StderrHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    """A stream handler that looks `sys.stderr` up when it emits, not when it is built.
+
+    Binding the object at configure time kept a stale stream after pytest capture or a
+    daemonising wrapper swapped or closed `sys.stderr`, and every later record was lost.
+    This is the stdlib's own `lastResort` pattern.
+    """
+
+    def __init__(self) -> None:
+        logging.Handler.__init__(self)
+
+    @property
+    def stream(self) -> IO[str]:
+        return sys.stderr
+
+
 def configure_logging(level: str = "INFO", stream: IO[str] | None = None) -> logging.Logger:
     """Install the JSON handler on the package logger and return it.
 
@@ -94,7 +121,9 @@ def configure_logging(level: str = "INFO", stream: IO[str] | None = None) -> log
     `propagate` is off for the same reason - a root handler configured by the host
     application would otherwise emit every record twice, once structured and once not.
     """
-    resolved = logging.getLevelNamesMapping().get(level.upper())
+    resolved = (
+        logging.getLevelNamesMapping().get(level.upper()) if level.upper() in LEVELS else None
+    )
     if resolved is None:
         # Resolved FIRST: an unknown level used to raise from `setLevel` after the old
         # handler was already removed, leaving the logger half-reconfigured.
@@ -102,7 +131,9 @@ def configure_logging(level: str = "INFO", stream: IO[str] | None = None) -> log
     logger = logging.getLogger(ROOT_LOGGER_NAME)
     for existing in [h for h in logger.handlers if getattr(h, "_procurement_json", False)]:
         logger.removeHandler(existing)
-    handler = logging.StreamHandler(stream if stream is not None else sys.stderr)
+    handler: logging.Handler = (
+        logging.StreamHandler(stream) if stream is not None else _StderrHandler()
+    )
     handler.setFormatter(JsonFormatter())
     handler._procurement_json = True  # type: ignore[attr-defined]
     logger.addHandler(handler)
