@@ -517,7 +517,7 @@ def test_every_exception_in_the_package_is_classified_or_listed_with_a_reason() 
         if not classified and name not in _UNCLASSIFIED_BY_DESIGN:
             unaccounted.append(name)
     assert not unaccounted, (
-        f"{unaccounted} classify as UNKNOWN. Register each in failures._BY_TYPE, give it a "
+        f"{unaccounted} classify as UNKNOWN. Register each in failures._by_type(), give it a "
         "ClassifiedError tag, or add it to _UNCLASSIFIED_BY_DESIGN with the reason."
     )
 
