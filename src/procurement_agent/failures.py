@@ -19,10 +19,11 @@ contract_violation  Our code broke one of its own invariants. Every other signal
                     attempt may be a consequence, and no number from it can be trusted.
 store_failure       A hung or failing database shows up downstream as a timeout or an
                     unparseable result; the store is the cause.
-timeout             A deadline expired (a `TimeoutError`). More specific than an adapter
-                    failure: it says the cause was slowness. A store or adapter that knows it
-                    was the one timing out tags its error with the more specific class, which
-                    outranks this one.
+timeout             A deadline expired (a `TimeoutError`). Outranks `adapter_failure`: "it was
+                    slow" is the more informative fact, and it names the bound to look at. Only
+                    `store_failure` outranks it, so a store that was the one timing out tags
+                    its error that way. An adapter whose call timed out is a `timeout`; it does
+                    not need, and cannot win with, an `adapter_failure` tag.
 adapter_failure     A port adapter raised, or its endpoint was unreachable. Outranks the
                     document classes because a parser *crashing* on a file looks exactly like a
                     file that cannot be parsed.
@@ -56,6 +57,21 @@ them, so only a tagged exception from the adapter or stage that raised it can re
 classifying the wrapper would blame the wrong party. A wrapper is left unregistered, so the
 exception it wraps decides.
 
+**Incomplete evidence is never trusted below the top class.** The chain walk reads at most
+`_MAX_LINKS` distinct exceptions. If it stops before it has read them all, a lower-ranked class
+found early cannot be trusted, because an unread link might hold a higher one, so the verdict is
+`UNKNOWN` unless the class found is already the top of the precedence. A truncated walk
+therefore fails loud rather than reporting a harness failure as a model miss.
+
+**Interruptions are not failures.** `asyncio.CancelledError`, `KeyboardInterrupt` and
+`SystemExit` carry no evidence and classify as `UNKNOWN`. The runner must handle a cancellation
+or a lost lease *before* it classifies; classifying one would quarantine a job that was merely
+interrupted.
+
+**Importing this module is cheap.** The type table is built on first use, not at import, so an
+adapter or a stage can import `ClassifiedError` to tag its errors without loading the rest of
+the package, and a service can import it without a circular import.
+
 Messages are never read. A classification is derived from exception *types* and explicit
 tags, so it cannot leak a credential that an exception message embeds, and `log_context`
 omits the message for the same reason.
@@ -66,13 +82,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import cache
 from typing import ClassVar
-
-from .audit.envelope import UnknownEventTypeError
-from .schema.encoding import UnencodableValueError
-from .services.claims import StoredValueLossError
-from .services.conflict_hitl import AutonomousOverwriteError, IncomparableCandidatesError
-from .services.vertical_slice import SanitizedCSVError
 
 __all__ = [
     "PRECEDENCE",
@@ -186,21 +197,38 @@ class ClassifiedError(Exception):
     failure_class: ClassVar[FailureClass] = FailureClass.UNKNOWN
 
 
-#: Exception types whose type alone implies the cause, matched by `isinstance` so a subclass
-#: inherits its parent's class. `ProposalError` is absent on purpose (a wrapper), while
-#: `StoredValueLossError`, its explicit programming-error subclass, is present. See the module
-#: docstring for why validation errors such as `OffContractFieldError` are absent.
-_BY_TYPE: tuple[tuple[type[BaseException], FailureClass], ...] = (
-    (AutonomousOverwriteError, FailureClass.CONTRACT_VIOLATION),
-    (IncomparableCandidatesError, FailureClass.CONTRACT_VIOLATION),
-    (StoredValueLossError, FailureClass.CONTRACT_VIOLATION),
-    (UnknownEventTypeError, FailureClass.CONTRACT_VIOLATION),
-    (UnencodableValueError, FailureClass.CONTRACT_VIOLATION),
-    (TimeoutError, FailureClass.TIMEOUT),
-    (SanitizedCSVError, FailureClass.INVALID_INPUT),
-)
+#: At most this many distinct exceptions are read from one chain, and the loop runs at most
+#: `_MAX_STEPS` times in total (repeats included), so a cycle or a pathological graph cannot
+#: hang the classifier.
+_MAX_LINKS = 64
+_MAX_STEPS = 1024
 
-_MAX_CHAIN = 16
+
+@cache
+def _by_type() -> tuple[tuple[type[BaseException], FailureClass], ...]:
+    """Exception types whose type alone implies the cause, matched by `isinstance`.
+
+    A subclass inherits its parent's class. `ProposalError` is absent on purpose (a wrapper),
+    while `StoredValueLossError`, its explicit programming-error subclass, is present. See the
+    module docstring for why validation errors such as `OffContractFieldError` are absent.
+
+    Built on first use so that importing this module does not import the services.
+    """
+    from .audit.envelope import UnknownEventTypeError
+    from .schema.encoding import UnencodableValueError
+    from .services.claims import StoredValueLossError
+    from .services.conflict_hitl import AutonomousOverwriteError, IncomparableCandidatesError
+    from .services.vertical_slice import SanitizedCSVError
+
+    return (
+        (AutonomousOverwriteError, FailureClass.CONTRACT_VIOLATION),
+        (IncomparableCandidatesError, FailureClass.CONTRACT_VIOLATION),
+        (StoredValueLossError, FailureClass.CONTRACT_VIOLATION),
+        (UnknownEventTypeError, FailureClass.CONTRACT_VIOLATION),
+        (UnencodableValueError, FailureClass.CONTRACT_VIOLATION),
+        (TimeoutError, FailureClass.TIMEOUT),
+        (SanitizedCSVError, FailureClass.INVALID_INPUT),
+    )
 
 
 def classify(evidence: Iterable[FailureClass]) -> FailureClass:
@@ -212,38 +240,6 @@ def classify(evidence: Iterable[FailureClass]) -> FailureClass:
     return FailureClass.UNKNOWN
 
 
-def _chain(exc: BaseException) -> Iterable[BaseException]:
-    """`exc` and what it was raised from, while handling, or alongside; cycle-safe and bounded.
-
-    Follows `__cause__`, `__context__` unless the author severed it with `raise ... from None`
-    (`__suppress_context__`, which Python's own traceback honours), and the members of a
-    `BaseExceptionGroup`: a timeout inside `asyncio.TaskGroup` surfaces as a group whose members
-    are linked by neither cause nor context.
-
-    Two independent guards: `seen` skips a link already visited, and `steps` caps the walk
-    outright. The cap is not redundant: a cycle never grows `seen`, so a bound written in terms
-    of `seen` alone would not stop one if the visited check were ever lost. **The walk reads at
-    most `_MAX_CHAIN` links.** A longer chain is classified from the links read, which can end
-    as `UNKNOWN`; that quarantines for a human, the fail-loud outcome, rather than guessing.
-    """
-    seen: set[int] = set()
-    pending: list[BaseException] = [exc]
-    for _ in range(_MAX_CHAIN):
-        if not pending:
-            return
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        yield current
-        links: list[BaseException | None] = [current.__cause__]
-        if not current.__suppress_context__:
-            links.append(current.__context__)
-        if isinstance(current, BaseExceptionGroup):
-            links.extend(current.exceptions)
-        pending.extend(link for link in links if link is not None)
-
-
 def _own_evidence(exc: BaseException) -> FailureClass | None:
     """The class one exception is evidence of, ignoring what it wraps."""
     if isinstance(exc, ClassifiedError):
@@ -253,21 +249,62 @@ def _own_evidence(exc: BaseException) -> FailureClass | None:
         tag = type(exc).failure_class
         if tag is not FailureClass.UNKNOWN:
             return tag
-    for exc_type, failure_class in _BY_TYPE:
+    for exc_type, failure_class in _by_type():
         if isinstance(exc, exc_type):
             return failure_class
     return None
+
+
+def _evidence(exc: BaseException) -> tuple[set[FailureClass], bool]:
+    """The classes found on `exc` and what it was raised from, while handling, or alongside,
+    and whether every link was read.
+
+    Follows `__cause__`, `__context__` unless the author severed it with `raise ... from None`
+    (`__suppress_context__`, which Python's traceback honours), and the members of a
+    `BaseExceptionGroup`: a timeout inside `asyncio.TaskGroup` surfaces as a group whose members
+    are linked by neither cause nor context.
+
+    Only *newly visited* exceptions count against `_MAX_LINKS`: several members of a group
+    commonly share one cause, and re-reading it must not spend budget meant for links not yet
+    seen. `_MAX_STEPS` bounds the loop independently, because a cycle never grows the visited
+    set and a bound written in terms of it alone would not stop one.
+    """
+    seen: set[int] = set()
+    found: set[FailureClass] = set()
+    pending: list[BaseException] = [exc]
+    for _ in range(_MAX_STEPS):
+        if not pending:
+            return found, True
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        if len(seen) >= _MAX_LINKS:
+            return found, False
+        seen.add(id(current))
+        if (evidence := _own_evidence(current)) is not None:
+            found.add(evidence)
+        links: list[BaseException | None] = [current.__cause__]
+        if not current.__suppress_context__:
+            links.append(current.__context__)
+        if isinstance(current, BaseExceptionGroup):
+            links.extend(current.exceptions)
+        pending.extend(link for link in links if link is not None)
+    return found, False
 
 
 def classify_exception(exc: BaseException) -> FailureClass:
     """Classify an exception from its whole chain, never its message.
 
     Every link contributes its own evidence and precedence picks the winner, so an
-    infrastructure failure beneath an unrecognised wrapper is still found, and a harness
-    class still outranks a model class that merely accompanied it.
+    infrastructure failure beneath an unrecognised wrapper is still found, and a harness class
+    still outranks a model class that merely accompanied it. If the walk could not read every
+    link, only the top class is trusted (see the module docstring); anything lower is `UNKNOWN`.
     """
-    evidence = (found for link in _chain(exc) if (found := _own_evidence(link)) is not None)
-    return classify(evidence)
+    evidence, complete = _evidence(exc)
+    verdict = classify(evidence)
+    if not complete and verdict is not PRECEDENCE[0]:
+        return FailureClass.UNKNOWN
+    return verdict
 
 
 def log_context(exc: BaseException) -> dict[str, str]:

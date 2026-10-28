@@ -5,10 +5,13 @@ means something: when two signals are present the root cause wins, and every har
 outranks every model class, so a broken harness can never be scored as a model miss.
 """
 
+import asyncio
 import importlib
 import itertools
 import pkgutil
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -78,6 +81,53 @@ def test_the_higher_ranked_class_wins_in_either_order(
     assert classify([lower, higher]) is higher
 
 
+def test_the_precedence_is_the_documented_order() -> None:
+    """Pinned against a literal, not against `PRECEDENCE` itself. The pairwise test above derives
+    its expectation from the tuple and so cannot notice the tuple changing; this is the one
+    place a reorder is a deliberate act that has to touch the test and the module docstring."""
+    assert [c.value for c in PRECEDENCE] == [
+        "contract_violation",
+        "store_failure",
+        "timeout",
+        "adapter_failure",
+        "unparseable_document",
+        "invalid_input",
+        "schema_violation",
+        "unknown",
+    ]
+
+
+class _StoreDown(ClassifiedError):
+    failure_class = FailureClass.STORE_FAILURE
+
+
+class _AdapterDown(ClassifiedError):
+    failure_class = FailureClass.ADAPTER_FAILURE
+
+
+def test_a_store_that_timed_out_reports_the_store_not_the_timeout() -> None:
+    """The documented way for a store to say it was the one timing out."""
+    try:
+        try:
+            raise TimeoutError("query exceeded its bound")
+        except TimeoutError as cause:
+            raise _StoreDown("vector store") from cause
+    except _StoreDown as wrapped:
+        assert classify_exception(wrapped) is FailureClass.STORE_FAILURE
+
+
+def test_an_adapter_call_that_timed_out_is_a_timeout_not_an_adapter_failure() -> None:
+    """The module docstring says an adapter's tag cannot win over the timeout beneath it, so
+    adapter authors should not bother tagging a timeout. This pins that statement."""
+    try:
+        try:
+            raise TimeoutError("ocr call exceeded its bound")
+        except TimeoutError as cause:
+            raise _AdapterDown("ocr") from cause
+    except _AdapterDown as wrapped:
+        assert classify_exception(wrapped) is FailureClass.TIMEOUT
+
+
 def test_no_evidence_is_unknown() -> None:
     assert classify([]) is FailureClass.UNKNOWN
 
@@ -102,7 +152,9 @@ def test_an_unreadable_document_records_parse_failure_and_nothing_else_does() ->
 
 
 def _ddl_job_statuses() -> set[str]:
-    check = re.search(r"CHECK \(status IN \(([^)]*)\)\)", _JOB_DDL.read_text())
+    # Anchored on the column, whitespace-tolerant, so a reformat or an earlier CHECK on another
+    # column cannot make this read the wrong list.
+    check = re.search(r"CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)", _JOB_DDL.read_text(), re.S)
     assert check is not None, "sql/08_job.sql no longer has a `CHECK (status IN (...))`"
     return set(re.findall(r"'(\w+)'", check.group(1)))
 
@@ -269,14 +321,68 @@ def test_a_cyclic_chain_terminates() -> None:
     assert classify_exception(a) is FailureClass.UNKNOWN
 
 
-def test_a_very_long_chain_is_bounded() -> None:
-    """The deepest link is a TimeoutError; the walk gives up first rather than recursing."""
-    head = TimeoutError("deep")
-    for _ in range(failures._MAX_CHAIN * 4):
+def _wrapped(inner: Exception, depth: int) -> Exception:
+    head = inner
+    for _ in range(depth):
         wrapper = RuntimeError("w")
         wrapper.__cause__ = head
-        head = wrapper  # type: ignore[assignment]
-    assert classify_exception(head) is FailureClass.UNKNOWN
+        head = wrapper
+    return head
+
+
+def test_a_chain_longer_than_the_cap_fails_loud_rather_than_guessing() -> None:
+    """The cause is past the cap, so it is not read. Nothing may be reported with confidence."""
+    deep = _wrapped(TimeoutError("deep"), failures._MAX_LINKS * 4)
+    assert classify_exception(deep) is FailureClass.UNKNOWN
+
+
+def test_a_lower_class_found_early_is_not_trusted_when_a_higher_one_may_be_unread() -> None:
+    """The invariant the module exists for: a model miss must never be reported while a
+    harness cause sits unread further down. Before the fix this returned SCHEMA_VIOLATION."""
+    top = ModelOutputRejected("rejected")
+    top.__cause__ = _wrapped(TimeoutError("harness cause"), failures._MAX_LINKS + 5)
+    assert classify_exception(top) is FailureClass.UNKNOWN
+
+
+def test_the_top_class_is_trusted_even_when_the_walk_is_cut_short() -> None:
+    """Nothing outranks CONTRACT_VIOLATION, so finding it settles the verdict regardless of what
+    remains unread."""
+    top = AutonomousOverwriteError("invariant")
+    top.__cause__ = _wrapped(TimeoutError("irrelevant"), failures._MAX_LINKS + 5)
+    assert classify_exception(top) is FailureClass.CONTRACT_VIOLATION
+
+
+def test_a_chain_exactly_at_the_cap_is_read_in_full() -> None:
+    at_cap = _wrapped(TimeoutError("cause"), failures._MAX_LINKS - 1)
+    assert classify_exception(at_cap) is FailureClass.TIMEOUT
+    past_cap = _wrapped(TimeoutError("cause"), failures._MAX_LINKS)
+    assert classify_exception(past_cap) is FailureClass.UNKNOWN
+
+
+def test_members_sharing_a_cause_do_not_spend_the_budget_re_reading_it() -> None:
+    """Only newly visited exceptions count. 40 siblings share one cause, so the walk pops it 40
+    times but visits it once; the 45 distinct links fit under the cap, while the ~85 pops do
+    not. The harness evidence is in the member popped last, so it is only reached if the
+    repeats were free."""
+    shared = RuntimeError("shared")
+    siblings: list[Exception] = []
+    for _ in range(40):
+        sibling = RuntimeError("sibling")
+        sibling.__cause__ = shared
+        siblings.append(sibling)
+    group = ExceptionGroup("g", [_wrapped(TimeoutError("real"), 2), *siblings])
+    assert classify_exception(group) is FailureClass.TIMEOUT
+
+
+@pytest.mark.parametrize(
+    "interruption", [asyncio.CancelledError(), KeyboardInterrupt(), SystemExit()], ids=repr
+)
+def test_an_interruption_is_not_a_failure_and_classifies_as_unknown(
+    interruption: BaseException,
+) -> None:
+    """Pinned so the behaviour is a decision rather than an accident: the runner must handle a
+    cancellation or lost lease before classifying, or it would quarantine an interrupted job."""
+    assert classify_exception(interruption) is FailureClass.UNKNOWN
 
 
 def test_the_message_is_never_read() -> None:
@@ -285,6 +391,23 @@ def test_the_message_is_never_read() -> None:
         FailureClass.UNKNOWN
     )
     assert classify_exception(TimeoutError("")) is FailureClass.TIMEOUT
+
+
+# --- importing the taxonomy must not load the package it classifies ----------------------
+
+
+def test_importing_the_taxonomy_does_not_import_the_services() -> None:
+    """An adapter imports `ClassifiedError` to tag its errors, and a service will too. If the
+    taxonomy imported the services at module level that would be a circular import, and every
+    adapter would load the workbook writer just to raise a tagged error."""
+    code = (
+        "import sys, procurement_agent.failures;"
+        "print(sorted(m for m in sys.modules if m.startswith('procurement_agent.services')))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "[]"
 
 
 # --- adapters state their own class -----------------------------------------------------

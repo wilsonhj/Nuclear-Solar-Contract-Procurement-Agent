@@ -3,7 +3,7 @@
 This audit reflects the `claude/phase-1-integration` branch as verified on 2026-08-29. It
 answers the practical question a new contributor has first: what can the repository do today?
 
-The local verification baseline is **1178 passing, 42 skipped, and 4 expected failures**
+The local verification baseline is **1189 passing, 42 skipped, and 4 expected failures**
 (re-measured 2026-10-28 on `main` plus the failure-taxonomy change; the narrative below was last
 audited on the date above and is not re-audited by that count), plus a
 clean Ruff check, a clean `ruff format --check`, and a clean strict-mypy check across `src/` and
@@ -167,10 +167,14 @@ outranks every model class**: when two signals are present the harness failure i
 reported, and an eval harness can exclude harness and unattributed attempts from an accuracy
 figure instead of scoring them as misses. `classify_exception()` reads an exception's chain by
 type, never by message: `__cause__`, `__context__` (unless severed with `raise ... from None`)
-and the members of an `ExceptionGroup`, up to 16 links, after which an unresolved chain ends
-as `unknown` and is quarantined. `log_context()` produces `extra=` context for the JSON logger
-without the message. Each class names a disposition (`retry` or `quarantine`, tasks I.2 and
-I.4), a fault group, the `job.status` values it may write, and an existing `audit.event` type.
+and the members of an `ExceptionGroup`, reading at most 64 distinct exceptions. If it cannot read
+the whole chain, only the top class (`contract_violation`) is trusted and everything else becomes
+`unknown`, which quarantines: a lower class found early cannot be trusted while a higher one may
+sit unread. Cancellation and `KeyboardInterrupt` are not failures and also classify as `unknown`,
+so the runner must handle them before classifying. `log_context()` produces `extra=` context for
+the JSON logger without the message. Each class names a disposition (`retry` or `quarantine`,
+tasks I.2 and I.4), a fault group, the `job.status` values it may write, and an existing
+`audit.event` type.
 
 **A type is evidence only when the type alone implies the cause.** The programming-error
 invariants (`AutonomousOverwriteError`, `StoredValueLossError`, ...) are registered by type.
