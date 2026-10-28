@@ -192,9 +192,25 @@ class ClassifiedError(Exception):
     classification travels with the exception instead of being re-derived from its text. The
     port Protocols are signature-stable, so this is how an adapter reports *why* without
     changing them.
+
+    A tag must be a `FailureClass` member, checked when the subclass is defined. An unchecked
+    tag failed silently: a typo such as `"tiemout"` was simply no evidence, and the error
+    surfaced as `UNKNOWN` in production instead of as a `TypeError` at import.
+
+    The tag is *one* piece of evidence, not the whole verdict. A subclass that is also a
+    registered type (`class OcrTimeout(ClassifiedError, TimeoutError)`) contributes both, and
+    precedence decides, exactly as it would had the two facts been split across a cause chain.
     """
 
     failure_class: ClassVar[FailureClass] = FailureClass.UNKNOWN
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        tag = cls.failure_class
+        if not isinstance(tag, FailureClass):
+            raise TypeError(
+                f"{cls.__qualname__}.failure_class must be a FailureClass member, got {tag!r}"
+            )
 
 
 #: At most this many distinct exceptions are read from one chain, and the loop runs at most
@@ -240,19 +256,27 @@ def classify(evidence: Iterable[FailureClass]) -> FailureClass:
     return FailureClass.UNKNOWN
 
 
-def _own_evidence(exc: BaseException) -> FailureClass | None:
-    """The class one exception is evidence of, ignoring what it wraps."""
+def _own_evidence(exc: BaseException) -> set[FailureClass]:
+    """Every class one exception is evidence of, ignoring what it wraps.
+
+    Its tag (if it states one) and every registered type it is an instance of, all together.
+    Returning only the first match made the answer depend on how an exception happened to be
+    written: an adapter error that is also a `TimeoutError` classified as `adapter_failure`
+    in one exception and as `timeout` when the same two facts were split across a cause chain,
+    contradicting the documented rule that `timeout` outranks `adapter_failure`.
+    """
+    found: set[FailureClass] = set()
     if isinstance(exc, ClassifiedError):
         # Read from the class, not the instance: the tag is class-level state, so the
         # classification depends on `type(exc)` alone and an exception built without running
         # `__init__` classifies exactly as one built normally.
         tag = type(exc).failure_class
         if tag is not FailureClass.UNKNOWN:
-            return tag
+            found.add(tag)
     for exc_type, failure_class in _by_type():
         if isinstance(exc, exc_type):
-            return failure_class
-    return None
+            found.add(failure_class)
+    return found
 
 
 def _evidence(exc: BaseException) -> tuple[set[FailureClass], bool]:
@@ -281,8 +305,7 @@ def _evidence(exc: BaseException) -> tuple[set[FailureClass], bool]:
         if len(seen) >= _MAX_LINKS:
             return found, False
         seen.add(id(current))
-        if (evidence := _own_evidence(current)) is not None:
-            found.add(evidence)
+        found |= _own_evidence(current)
         links: list[BaseException | None] = [current.__cause__]
         if not current.__suppress_context__:
             links.append(current.__context__)

@@ -432,6 +432,69 @@ def test_the_tag_is_read_from_the_class_not_the_instance() -> None:
     assert classify_exception(instance) is FailureClass.UNKNOWN
 
 
+def test_an_exception_that_is_both_tagged_and_a_registered_type_contributes_both() -> None:
+    """The same two facts must classify the same whether they sit in one exception or are split
+    across a cause chain. Before the fix the first reported adapter_failure and the second
+    timeout, contradicting the documented rule that a timeout outranks an adapter failure."""
+
+    class OcrTimeout(ClassifiedError, TimeoutError):
+        failure_class = FailureClass.ADAPTER_FAILURE
+
+    one_exception = classify_exception(OcrTimeout("ocr call exceeded its bound"))
+    try:
+        try:
+            raise TimeoutError("ocr call exceeded its bound")
+        except TimeoutError as cause:
+            raise _AdapterDown("ocr") from cause
+    except _AdapterDown as split:
+        assert classify_exception(split) is one_exception
+    assert one_exception is FailureClass.TIMEOUT
+
+
+def test_a_store_tag_on_a_timeout_subclass_still_wins() -> None:
+    class StoreTimeout(ClassifiedError, TimeoutError):
+        failure_class = FailureClass.STORE_FAILURE
+
+    assert classify_exception(StoreTimeout("x")) is FailureClass.STORE_FAILURE
+
+
+def test_an_untagged_classified_error_keeps_the_evidence_of_its_other_bases() -> None:
+    class Plain(ClassifiedError, TimeoutError):
+        pass
+
+    assert classify_exception(Plain("x")) is FailureClass.TIMEOUT
+
+
+def test_an_exception_reports_every_registered_type_it_matches() -> None:
+    """Not just the first row of the table: a hit-order dependency would make the verdict
+    depend on how `_by_type()` happens to be ordered."""
+
+    class Both(SanitizedCSVError, TimeoutError):
+        pass
+
+    assert failures._own_evidence(Both("x")) == {
+        FailureClass.TIMEOUT,
+        FailureClass.INVALID_INPUT,
+    }
+
+
+@pytest.mark.parametrize("bad", ["tiemout", "timeout", None, 3, FailureClass.TIMEOUT.value])
+def test_a_malformed_tag_fails_at_class_definition_not_silently_in_production(bad: object) -> None:
+    """A typo used to be no evidence at all and surfaced as UNKNOWN at runtime. A plain string
+    is refused too, even a valid value: the tag is a FailureClass member or nothing."""
+    with pytest.raises(TypeError, match="must be a FailureClass member"):
+
+        class Mistyped(ClassifiedError):
+            failure_class = bad  # type: ignore[assignment]
+
+
+def test_a_subclass_of_a_tagged_class_inherits_a_valid_tag() -> None:
+    class Child(_AdapterDown):
+        pass
+
+    assert classify_exception(Child("x")) is FailureClass.ADAPTER_FAILURE
+
+
 def test_an_untagged_classified_error_is_no_evidence_rather_than_a_guess() -> None:
     class Untagged(ClassifiedError):
         pass

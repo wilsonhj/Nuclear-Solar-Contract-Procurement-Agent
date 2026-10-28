@@ -3,7 +3,7 @@
 This audit reflects the `claude/phase-1-integration` branch as verified on 2026-08-29. It
 answers the practical question a new contributor has first: what can the repository do today?
 
-The local verification baseline is **1189 passing, 42 skipped, and 4 expected failures**
+The local verification baseline is **1199 passing, 42 skipped, and 4 expected failures**
 (re-measured 2026-10-28 on `main` plus the failure-taxonomy change; the narrative below was last
 audited on the date above and is not re-audited by that count), plus a
 clean Ruff check, a clean `ruff format --check`, and a clean strict-mypy check across `src/` and
@@ -180,7 +180,9 @@ tasks I.2 and I.4), a fault group, the `job.status` values it may write, and an 
 invariants (`AutonomousOverwriteError`, `StoredValueLossError`, ...) are registered by type.
 Validation rejections are not: `OffContractFieldError` and `VocabularyError` are raised for
 supplier data, caller bugs and model output alike, so the code that knows tags its error with a
-`ClassifiedError` subclass. For the same reason `store_failure`, `adapter_failure`,
+`ClassifiedError` subclass, whose tag is validated when the class is defined and is combined with
+any registered type the exception also is (an `OcrTimeout(ClassifiedError, TimeoutError)` is a
+`timeout`, as it would be were the two facts split across a cause chain). For the same reason `store_failure`, `adapter_failure`,
 `unparseable_document` and `schema_violation` are reachable only by tag; no exception type in
 the package implies them. A test fails if an exception is added to the package without being
 classified or listed as unclassified by design with a reason.
