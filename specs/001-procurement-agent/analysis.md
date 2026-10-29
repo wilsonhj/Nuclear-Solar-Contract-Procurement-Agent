@@ -1112,3 +1112,15 @@ them; the permissive variants from #39 are not carried.
   scaffolding stage; assigned to WP-A.
 - **NFR-06 and NFR-07 have no verification.** Both are scale/latency properties that need a
   running system. Assigned to WP-I.
+
+---
+
+# Round 8 — ADR-002 registrations (2026-10-28)
+
+Two places where [ADR-002](../../docs/decisions/ADR-002-deepening-the-claims-to-workbook-path.md)
+goes beyond a ratified decision, registered here so neither is chosen silently.
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| A-63 | **M** | D-19 requires `section` (the heading path) on every parsed element in every format, but D-23's additive extension of `ParsedElement` lists four fields and not `section`, so the ratified interface cannot carry what D-19 promises | **Registered** — ADR-002 decision 7 adds `section` as a fifth optional field in the same PR as D-23's four |
+| A-64 | **M** | D-21 puts every request behind an OIDC session; the single-user local workspace has no identity provider to sign in to | **Registered** — ADR-002 decision 11: one fixed local principal, loopback bind only, `Origin` and `Host` checked on every request. Applies to the local workspace only, never to the reviewer surface |
