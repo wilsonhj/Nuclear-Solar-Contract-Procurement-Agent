@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Document parsing / OCR. Apache-2.0 and MIT only. Research verified licences at
+# Document parsing / OCR. Apache-2.0, MIT and BSD only. Research verified licences at
 # primary sources and rejected: Marker (weights revenue-capped), Surya (GPL-3.0),
 # MinerU (AGPL-3.0), olmOCR (Rail-M revenue cap). See plan.md licence gate.
 #
