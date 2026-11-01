@@ -320,7 +320,7 @@ CREATE FUNCTION public.document_is_restricted(p_document_id text)
             true)
     END;
 $$ SECURITY DEFINER
-   SET search_path = public, pg_temp
+   SET search_path = pg_catalog, pg_temp
    SET app.allow_restricted = 'true';
 
 ALTER FUNCTION public.document_is_restricted(text) OWNER TO procurement_owner;

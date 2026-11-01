@@ -487,7 +487,7 @@ def test_a_re_sealed_suffix_is_not_detectable_and_that_is_expected() -> None:
 
 
 def test_a_the_cli_refuses_a_stream_that_cannot_exist(
-    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A typo must not come back as a clean bill of health.
 
@@ -497,7 +497,8 @@ def test_a_the_cli_refuses_a_stream_that_cannot_exist(
     document id. Checked before connecting, so this test needs no server - and
     so the answer never depends on reaching one.
     """
-    assert verify_main(["--dsn", "postgresql:///unused", "--stream", "global"]) == 2
+    monkeypatch.setenv("PROCUREMENT_DATABASE_URL", "postgresql:///unused")
+    assert verify_main(["--stream", "global"]) == 2
     assert "doc:" in capsys.readouterr().out
 
 
@@ -576,6 +577,7 @@ def _empty_server(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = types.ModuleType("psycopg")
     fake.connect = lambda *a, **k: _EmptyConn()  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "psycopg", fake)
+    monkeypatch.setenv("PROCUREMENT_DATABASE_URL", "postgresql:///unused")
 
 
 def test_a_named_stream_that_is_not_there_is_a_failure_not_an_ok(
@@ -592,9 +594,7 @@ def test_a_named_stream_that_is_not_there_is_a_failure_not_an_ok(
 
     A cron pinned to a single document would report success forever.
     """
-    code = verify_main(
-        ["--dsn", "postgresql:///unused", "--stream", "doc:11111111-1111-4111-8111-111111111112"]
-    )
+    code = verify_main(["--stream", "doc:11111111-1111-4111-8111-111111111112"])
     out = capsys.readouterr().out
     assert "OK" not in out, out
     assert code != 0
@@ -611,7 +611,7 @@ def test_an_empty_log_says_so_rather_than_printing_nothing(
     "I verified nothing" and "I verified everything and it was fine" had the
     same output.
     """
-    code = verify_main(["--dsn", "postgresql:///unused"])
+    code = verify_main([])
     out = capsys.readouterr().out
     assert out.strip(), "printed nothing at all"
     assert "no audit streams" in out.lower()
@@ -689,11 +689,42 @@ def test_a_stream_the_verifier_cannot_hash_does_not_stop_the_streams_after_it(
     fake = types.ModuleType("psycopg")
     fake.connect = lambda *a, **k: _ScriptedConn(log)  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "psycopg", fake)
+    monkeypatch.setenv("PROCUREMENT_DATABASE_URL", "postgresql:///unused")
 
-    code = verify_main(["--dsn", "postgresql:///unused"])
+    code = verify_main([])
     out = capsys.readouterr().out
 
     assert "doc:open-2" in out, "the run died on doc:open-1 and never reached doc:open-2"
     assert str(DefectKind.HASH_MISMATCH) in out, "the tamper in doc:open-2 was never reported"
     assert str(DefectKind.PAYLOAD_NOT_REPRESENTABLE) in out
     assert code == 1
+
+
+def test_cli_falls_back_to_procurement_database_url_env(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The connection string comes from `PROCUREMENT_DATABASE_URL`. `--dsn` is
+    refused so the secret never appears in the process list. With neither the
+    flag nor the variable, the CLI exits 2."""
+    monkeypatch.delenv("PROCUREMENT_DATABASE_URL", raising=False)
+    assert verify_main([]) == 2
+    err_out = capsys.readouterr()
+    assert "PROCUREMENT_DATABASE_URL" in (err_out.out + err_out.err)
+
+    captured_dsn: list[str] = []
+
+    def _fake_connect(dsn: str, **kwargs: object) -> _EmptyConn:
+        captured_dsn.append(dsn)
+        return _EmptyConn()
+
+    fake = types.ModuleType("psycopg")
+    fake.connect = _fake_connect  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "psycopg", fake)
+    monkeypatch.setenv("PROCUREMENT_DATABASE_URL", "postgresql://env-host/procurement")
+
+    assert verify_main([]) == 0
+    assert captured_dsn == ["postgresql://env-host/procurement"]
+    assert verify_main(["--dsn", "postgresql://user:secret@localhost/db"]) == 2
+    refused = capsys.readouterr()
+    assert "--dsn is refused" in (refused.out + refused.err)
+    assert captured_dsn == ["postgresql://env-host/procurement"]

@@ -57,9 +57,11 @@ be built from its output.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from ..schema.encoding import is_aware
 from .canonical import JsonObject, JsonValue, canonical_text
 
 __all__ = [
@@ -219,12 +221,24 @@ def format_recorded_at(moment: datetime) -> str:
             caller did not mean into the one field whose purpose is being
             tamper-evident.
     """
-    if moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None:
+    if not is_aware(moment):
         raise ValueError(
             f"naive datetime {moment!r}: recorded_at is hashed, so it must name an instant. "
             "Attach a timezone at the boundary that produced it."
         )
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def _as_plain_json(value: JsonValue) -> JsonValue:
+    if isinstance(value, Mapping):
+        return {key: _as_plain_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_as_plain_json(item) for item in value]
+    return value
+
+
+def _as_plain_object(payload: JsonObject) -> dict[str, JsonValue]:
+    return {key: _as_plain_json(item) for key, item in payload.items()}
 
 
 def build_preimage(
@@ -260,7 +274,7 @@ def build_preimage(
         "actor": actor,
         "recorded_at": recorded_at,
         "prev_hash": None if prev_hash is None else prev_hash.hex(),
-        "payload": payload,
+        "payload": _as_plain_object(payload),
     }
 
 
@@ -271,7 +285,7 @@ def digest_of(preimage: JsonObject) -> bytes:
     `octet_length(...) = 32` CHECKs in `sql/07` already assume it, and "the
     digest and these two CHECKs now move together or not at all".
     """
-    return hashlib.sha256(canonical_text(preimage).encode("utf-8")).digest()
+    return hashlib.sha256(canonical_text(_as_plain_object(preimage)).encode("utf-8")).digest()
 
 
 def build_event(
@@ -307,7 +321,7 @@ def build_event(
     # downstream narrows this. D-13's `"payload": {...}` is a constraint, not
     # formatting: a scalar payload produces a chain that verifies and an audit
     # record with no field names in it.
-    if not isinstance(payload, dict):
+    if not isinstance(payload, Mapping):
         raise TypeError(
             f"payload must be a JSON object, not {type(payload).__name__}. D-13's preimage "
             "embeds it as an object; a scalar would canonicalise and INSERT cleanly and be "
@@ -317,6 +331,7 @@ def build_event(
     seq = 0 if tip is None else tip.seq + 1
     prev_hash = None if tip is None else tip.hash
     stream = stream_for_document(document_id)
+    plain_payload = _as_plain_object(payload)
     return AuditEvent(
         stream=stream,
         document_id=document_id,
@@ -331,13 +346,13 @@ def build_event(
                 actor=actor,
                 recorded_at=format_recorded_at(recorded_at),
                 prev_hash=prev_hash,
-                payload=payload,
+                payload=plain_payload,
             )
         ),
         event_type=event_type,
         actor=actor,
         # JCS of the payload alone. The verifier recomputes the envelope around
         # it; this column is never the thing that gets hashed.
-        payload_canonical=canonical_text(payload),
+        payload_canonical=canonical_text(plain_payload),
         recorded_at=recorded_at,
     )

@@ -249,6 +249,11 @@ def _encode_map(mapping: dict[object, object]) -> dict[str, object]:
     return {"$map": sorted(pairs, key=_sort_key)}
 
 
+def is_aware(value: datetime) -> bool:
+    """Whether a datetime carries a concrete timezone offset."""
+    return value.tzinfo is not None and value.tzinfo.utcoffset(value) is not None
+
+
 def _rfc3339(value: datetime) -> str:
     """RFC 3339 in UTC with microseconds always printed.
 
@@ -266,12 +271,23 @@ def _rfc3339(value: datetime) -> str:
     `isoformat()` omits `.000000` when the field is zero, which is why the format
     is pinned here rather than delegated.
     """
-    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+    if not is_aware(value):
         raise UnencodableValueError(
             f"naive datetime {value!r}: it names no instant, so it cannot be encoded "
             "without inventing a zone. Attach one at the boundary that produced it."
         )
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def canonical_json(value: object) -> str:
+    """Serialize any domain value to D-14 canonical JSON text."""
+    return json.dumps(
+        encode_value(value),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _sort_key(encoded: object) -> str:

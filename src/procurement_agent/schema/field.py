@@ -33,6 +33,7 @@ from pydantic import (
     model_validator,
 )
 
+from .encoding import is_aware
 from .enums import (
     ComponentCategory,
     ConflictClass,
@@ -132,7 +133,7 @@ class SourceRef(BaseModel):
         noon-UTC are not equal in Python, so two references to one fetch would
         compare unequal while encoding identically.
         """
-        if value is not None and (value.tzinfo is None or value.tzinfo.utcoffset(value) is None):
+        if value is not None and not is_aware(value):
             raise ValueError(
                 "retrieved_at must be timezone-aware; a naive datetime names no "
                 "instant. Attach the zone at the boundary that produced it."
@@ -154,7 +155,7 @@ def _aware_datetime(value: datetime, slot: str) -> datetime:
     one here would recreate the SourceRef hole: the schema calls the value legal
     and the encoder then raises from a sort or hash path.
     """
-    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+    if not is_aware(value):
         raise ValueError(
             f"{slot} must be timezone-aware; a naive datetime names no instant. "
             "Attach the zone at the boundary that produced it."
@@ -178,6 +179,11 @@ class Resolution(BaseModel):
     @classmethod
     def _resolved_at_must_name_an_instant(cls, value: datetime) -> datetime:
         return _aware_datetime(value, "resolved_at")
+
+    @field_validator("value_before", "value_after")
+    @classmethod
+    def _values_must_be_encodable(cls, value: object) -> object:
+        return _reject_non_finite_value(value)
 
 
 def _as_resolution(value: object) -> object:
@@ -218,20 +224,29 @@ class DeclaredBandUnitError(ValueError):
     """
 
 
+_RATE_UNIT_ALIASES: dict[str, str] = {
+    "%/k": "%/degc",
+    "%/°c": "%/degc",
+}
+
+
 def _comparable_unit(value: str | None) -> str | None:
-    """A unit folded for equality, the way `conflict_hitl._normalise_text` folds
-    one: NFKC, case, and internal whitespace.
+    """A unit folded for equality, the way `conflict_hitl._normalise_unit` folds
+    one: NFKC, case, internal whitespace, slash spacing, and D-5's rate aliases.
 
     Spelling only. `w` and `W` are one unit; `W` and `Wp` are not, and neither
     are `W` and `kW`. Deciding that two differently-spelled units name one
     quantity is a technical claim, and the one place this repo makes such a claim
-    - `%/degC` against `%/K` - it makes it from three documents that state it,
-    in a named table, in the module that compares candidate units. Guessing here
-    would be the "conversion resolves a mismatch" move FR-ING-08 forbids.
+    - `%/degC` against `%/K` - is shared here so `DeclaredBand` agrees with
+    `values_conflict` (D-5).
     """
     if value is None:
         return None
-    return " ".join(unicodedata.normalize("NFKC", value).casefold().split()) or None
+    folded = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+    if not folded:
+        return None
+    compact = "/".join(part.strip() for part in folded.split("/"))
+    return _RATE_UNIT_ALIASES.get(compact, compact)
 
 
 class DeclaredBand(BaseModel):
@@ -737,7 +752,7 @@ class Condition(ConditionDimensions):
         return True
 
 
-def _reject_non_finite_value(value: object) -> object:
+def _reject_non_finite_value(value: object, _containers: tuple[int, ...] = ()) -> object:
     """Refuse a value the canonical encoder will refuse, at the point it is stored.
 
     `CanonicalField.value` is `object | None`, which is what the contract's type
@@ -761,9 +776,8 @@ def _reject_non_finite_value(value: object) -> object:
 
     Nested `BaseModel`s are left to their own validators - `DeclaredBand` already
     rejects a non-finite bound, and re-checking it here would be a second
-    statement of a rule that has a home. A self-referential value is not guarded
-    against for the same reason `encode_value` does not: `json.dumps` cannot
-    represent one either, so it fails at the same boundary by the same route.
+    statement of a rule that has a home. A cycle guard prevents infinite
+    recursion on self-referential containers before they reach `encode_value`.
     """
     if isinstance(value, bool):  # before the numeric branch - bool is an int
         return value
@@ -776,13 +790,16 @@ def _reject_non_finite_value(value: object) -> object:
         )
     if isinstance(value, str | bytes | bytearray):
         return value
+    if id(value) in _containers:
+        return value
+    nested = (*_containers, id(value))
     if isinstance(value, Mapping):
         for key, item in value.items():
-            _reject_non_finite_value(key)
-            _reject_non_finite_value(item)
+            _reject_non_finite_value(key, nested)
+            _reject_non_finite_value(item, nested)
     elif isinstance(value, list | tuple | set | frozenset):
         for item in value:
-            _reject_non_finite_value(item)
+            _reject_non_finite_value(item, nested)
     return value
 
 
@@ -888,14 +905,19 @@ class CanonicalField(BaseModel):
         RESOLVED is refused here too, so `evolve(conflict_status=OPEN)` cannot
         hide a recorded decision by rewriting only the stored enum.
         """
-        if not isinstance(data, dict) or "conflict_status" not in data:
+        if not isinstance(data, dict):
+            return data
+        if "conflict_status" not in data:
+            if data.get("resolution") is not None:
+                data = dict(data)
+                data["unresolved_status"] = UnresolvedStatus.NONE
             return data
         data = dict(data)
         status = ConflictStatus(data.pop("conflict_status"))
         if status is ConflictStatus.RESOLVED:
             if data.get("resolution") is None:
                 raise ValueError("a resolved field must carry its Resolution (FR-HITL-06)")
-            data.setdefault("unresolved_status", UnresolvedStatus.NONE)
+            data["unresolved_status"] = UnresolvedStatus.NONE
         else:
             if data.get("resolution") is not None:
                 raise ValueError(
@@ -920,6 +942,7 @@ class CanonicalField(BaseModel):
         if status is ConflictStatus.RESOLVED:
             if self.resolution is None:
                 raise ValueError("a resolved field must carry its Resolution (FR-HITL-06)")
+            self.unresolved_status = UnresolvedStatus.NONE
             return
         if self.resolution is not None:
             raise ValueError(
@@ -1026,6 +1049,7 @@ class CanonicalField(BaseModel):
             if status is ConflictStatus.RESOLVED:
                 if values.get("resolution") is None:
                     raise ValueError("a resolved field must carry its Resolution (FR-HITL-06)")
+                values["unresolved_status"] = UnresolvedStatus.NONE
             else:
                 if values.get("resolution") is not None:
                     raise ValueError(
@@ -1034,6 +1058,8 @@ class CanonicalField(BaseModel):
                         f"{status.value}"
                     )
                 values["unresolved_status"] = UnresolvedStatus(status.value)
+        elif values.get("resolution") is not None:
+            values["unresolved_status"] = UnresolvedStatus.NONE
         return super().model_construct(_fields_set, **values)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -1062,6 +1088,13 @@ class CanonicalField(BaseModel):
         if name == "resolution" and self._replaces_recorded_resolution(value):
             raise ValueError(_RESOLUTION_IS_APPEND_ONLY)
         super().__setattr__(name, value)
+        if (
+            name == "resolution"
+            and getattr(self, "resolution", None) is not None
+            and getattr(self, "unresolved_status", UnresolvedStatus.NONE)
+            is not UnresolvedStatus.NONE
+        ):
+            super().__setattr__("unresolved_status", UnresolvedStatus.NONE)
 
     def _replaces_recorded_resolution(self, incoming: object) -> bool:
         """Whether `incoming` would change a decision already on this field.

@@ -60,6 +60,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -471,9 +473,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--dsn",
-        required=True,
-        help="PostgreSQL connection string. Use an identity entitled to read restricted "
-        "documents: a walk that silently skipped rows would report broken links.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--stream",
@@ -483,6 +484,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Verify only this stream. Repeatable. Defaults to every stream present.",
     )
     args = parser.parse_args(argv)
+    if args.dsn is not None:
+        print(
+            "error: --dsn is refused because a connection string on the command line "
+            "is visible in the process list. Set PROCUREMENT_DATABASE_URL instead.",
+            file=sys.stderr,
+        )
+        return 2
+    dsn = os.environ.get("PROCUREMENT_DATABASE_URL")
+    if not dsn:
+        print(
+            "error: a database connection string is required via PROCUREMENT_DATABASE_URL.",
+            file=sys.stderr,
+        )
+        return 2
 
     # A stream that cannot exist would otherwise return zero rows and report OK,
     # which is the one output an operator must never get from a typo. Checked
@@ -503,7 +518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     failed = 0
-    with psycopg.connect(args.dsn, autocommit=True) as conn:
+    with psycopg.connect(dsn, autocommit=True) as conn:
         # sql/07: the verifier runs as an operator identity that sets this,
         # "exactly as the confidentiality model intends".
         conn.execute("SET app.allow_restricted = 'true'")

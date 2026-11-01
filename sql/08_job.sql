@@ -90,6 +90,7 @@ CREATE INDEX job_document_id_idx ON public.job (document_id);
 
 CREATE FUNCTION public.job_touch_updated_at() RETURNS trigger
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp
     AS $$
 BEGIN
     NEW.updated_at := clock_timestamp();

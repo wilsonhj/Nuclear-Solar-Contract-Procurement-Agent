@@ -311,9 +311,14 @@ def test_the_app_role_cannot_declassify_rows_it_cannot_read(seeded: None) -> Non
     `UPDATE 2` as `procurement_app` and declassified a row that role could not
     SELECT one statement earlier. The write policies were `USING (true)`, which
     is permissive and OR's with the confidentiality policy, and a WHERE-less
-    UPDATE needs no SELECT."""
+    UPDATE needs no SELECT.
+
+    The standing grant is now SELECT-only, so the same statement is refused
+    before row-level security runs. The restricted row stays restricted.
+    """
     with _connect(user="procurement_app") as app:
-        app.execute("UPDATE public.chunk SET access_restricted = false")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            app.execute("UPDATE public.chunk SET access_restricted = false")
         visible = app.execute("SELECT chunk_id FROM public.chunk").fetchall()
     assert [row[0] for row in visible] == ["chunk-open"]
 
@@ -324,26 +329,45 @@ def test_the_app_role_cannot_declassify_rows_it_cannot_read(seeded: None) -> Non
     assert still is not None and still[0] == 1
 
 
+def test_the_app_role_cannot_mutate_chunks(seeded: None) -> None:
+    """SEC-HIGH-2: `procurement_app` is SELECT-only on `chunk`."""
+    with _connect(user="procurement_app") as app:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            app.execute("UPDATE public.chunk SET section = 'tampered'")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            app.execute("DELETE FROM public.chunk")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            app.execute(
+                """
+                INSERT INTO public.chunk
+                    (chunk_id, document_id, chunk_kind, source_tier, chunk_text, embedding)
+                VALUES ('chunk-app', 'open-1', 'prose', 'system_of_record',
+                        'no', array_fill(0.3, array[1024])::vector)
+                """
+            )
+
+
 def test_the_write_policy_alone_protects_an_unreadable_row(seeded: None) -> None:
     """Isolates the RLS policy from the inheritance trigger.
 
-    The test above asserts an *outcome* that two independent mechanisms both
-    provide: the write policy refuses the row, and the inheritance trigger would
-    re-derive `access_restricted` even if it did not. Reverting the policy to
-    `USING (true)` therefore left it green — the trigger silently covered for it.
-    A defence-in-depth arrangement is good; a test that cannot tell which layer
-    is holding is not, because the day someone removes the other layer nothing
-    goes red.
-
-    So this writes `section`, which no trigger touches and which the app role is
-    granted. Only the policy can refuse it.
+    `procurement_app` is SELECT-only on `chunk`. The standing GRANT no longer
+    reaches this UPDATE, so the test re-grants `section` for the duration: that
+    is the only way to prove the restrictive policy still refuses an unreadable
+    row independently of the grant, which is what used to go green when the
+    policy was `USING (true)` and the inheritance trigger covered for it.
     """
-    with _connect(user="procurement_app") as app:
-        app.execute("UPDATE public.chunk SET section = 'tampered'")
-    with _entitled() as owner:
-        rows = owner.execute(
-            "SELECT chunk_id, section FROM public.chunk ORDER BY chunk_id"
-        ).fetchall()
+    with _superuser() as conn:
+        conn.execute("GRANT UPDATE (section) ON public.chunk TO procurement_app")
+    try:
+        with _connect(user="procurement_app") as app:
+            app.execute("UPDATE public.chunk SET section = 'tampered'")
+        with _entitled() as owner:
+            rows = owner.execute(
+                "SELECT chunk_id, section FROM public.chunk ORDER BY chunk_id"
+            ).fetchall()
+    finally:
+        with _superuser() as conn:
+            conn.execute("REVOKE UPDATE ON public.chunk FROM procurement_app")
     by_id: dict[str, str | None] = dict(rows)
     assert by_id["chunk-secret"] is None, "an unreadable row was modified"
     assert by_id["chunk-open"] == "tampered", "a readable row must still be writable"
@@ -363,13 +387,19 @@ def test_the_document_write_policy_alone_protects_an_unreadable_row(seeded: None
     assert by_id["open-1"] is not None, "a readable document must still be writable"
 
 
-def test_the_app_role_cannot_delete_rows_it_cannot_read(seeded: None) -> None:
-    """Same policy defect, the other verb: `DELETE FROM public.chunk` destroyed
-    a row the role could not see."""
-    with _connect(user="procurement_app") as app:
-        app.execute("DELETE FROM public.chunk")
-    with _entitled() as owner:
-        remaining = owner.execute("SELECT chunk_id FROM public.chunk").fetchall()
+def test_the_write_policy_alone_protects_an_unreadable_delete(seeded: None) -> None:
+    """Same policy defect, the other verb. The standing GRANT no longer includes
+    DELETE for `procurement_app`; the temporary grant isolates the policy."""
+    with _superuser() as conn:
+        conn.execute("GRANT DELETE ON public.chunk TO procurement_app")
+    try:
+        with _connect(user="procurement_app") as app:
+            app.execute("DELETE FROM public.chunk")
+        with _entitled() as owner:
+            remaining = owner.execute("SELECT chunk_id FROM public.chunk").fetchall()
+    finally:
+        with _superuser() as conn:
+            conn.execute("REVOKE DELETE ON public.chunk FROM procurement_app")
     assert [row[0] for row in remaining] == ["chunk-secret"]
 
 
@@ -500,11 +530,11 @@ def seeded_all(seeded: None) -> Iterator[None]:
             """
             INSERT INTO audit.event
                 (stream, document_id, seq, prev_hash, hash, event_type, actor,
-                 payload_canonical)
+                 payload_canonical, recorded_at)
             VALUES ('doc:secret-1','secret-1',0,NULL,%s,'extraction','test',
-                    '{"price_per_watt_dc":0.19}'),
+                    '{"price_per_watt_dc":0.19}', now()),
                    ('doc:open-1','open-1',0,NULL,%s,'extraction','test',
-                    '{"nameplate_power":700}')
+                    '{"nameplate_power":700}', now())
             """,
             (GENESIS_HASH, CHILD_HASH),
         )
@@ -731,8 +761,9 @@ def _event(conn: psycopg.Connection, seq: int, prev: bytes | None, digest: bytes
     conn.execute(
         """
         INSERT INTO audit.event
-            (stream, document_id, seq, prev_hash, hash, event_type, actor, payload_canonical)
-        VALUES ('doc:open-1', 'open-1', %s, %s, %s, 'extraction', 'test', '{}')
+            (stream, document_id, seq, prev_hash, hash, event_type, actor,
+             payload_canonical, recorded_at)
+        VALUES ('doc:open-1', 'open-1', %s, %s, %s, 'extraction', 'test', '{}', now())
         """,
         (seq, prev, digest),
     )

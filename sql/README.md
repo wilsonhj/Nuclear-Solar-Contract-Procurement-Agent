@@ -30,7 +30,7 @@ gets the dependency order right automatically:
 | `02_document.sql` | `document` + RLS | `00`, `01` |
 | `03_chunk.sql` | `chunk` + RLS + tsvector/trgm indexes | `01`, `02` |
 | `04_claim.sql` | `claim` + RLS, plus the shared `public.reject_mutation()` trigger function | `02` |
-| `05_conflict.sql` | `conflict` + RLS, `conflict_candidate` (no RLS — see below), `public.conflict_is_restricted()` | `04` |
+| `05_conflict.sql` | `conflict` + RLS, `conflict_candidate` + FORCE RLS (EXISTS on parent `conflict`; no `conflict_is_restricted` recursion), `public.conflict_is_restricted()` | `04` |
 | `06_resolution.sql` | `resolution` + RLS | `04`, `05` |
 | `07_audit_event.sql` | `audit.event` + RLS, hash-chain columns, both trigger tripwires | `01`, `02` |
 | `08_job.sql` | `job` (stage state machine) + RLS | `02` |
@@ -380,13 +380,16 @@ follows is what a live run on 16 and 17 still could not reach.
   directory still looked correct. Nothing in DDL can check this; it is a
   deployment property, and it is the single most important thing to get right
   when wiring the application up.
-- **`conflict_candidate` has no RLS**, deliberately. A policy on it calling
-  `conflict_is_restricted` — which reads it — is a genuine infinite recursion,
-  which PostgreSQL rejects at query time rather than at `CREATE POLICY`. The
-  residual exposure is that an unentitled role can see that some conflict has
-  some number of candidate rows; it recovers no value, unit, verbatim text or
-  document id, because `claim` and `conflict` are both gated. Small, real, and
-  recorded rather than closed.
+- **`conflict_candidate` has FORCE RLS**, inheriting parent `conflict`
+  visibility via `EXISTS (SELECT 1 FROM public.conflict c WHERE c.entry_id =
+  ...)`. A policy that called `conflict_is_restricted` — which reads this table
+  — is a genuine infinite recursion, which PostgreSQL rejects at query time
+  rather than at `CREATE POLICY`. Owner/audit roles keep `USING (true)` so the
+  SECURITY DEFINER walk inside `conflict_is_restricted` still sees every
+  candidate under FORCE RLS. The residual exposure is that those NOLOGIN owner
+  roles can see that some restricted conflict has some number of candidate
+  rows; they recover no value, unit, verbatim text or document id. Small, real,
+  and recorded rather than closed.
 
 ## Design decisions made here that the specs did not settle
 
@@ -569,8 +572,10 @@ can check exactly these choices rather than re-deriving the whole schema.
     time — and deriving on read means a reclassification takes effect immediately
     across every dependent table, with no backfill to forget.
 
-    `conflict_candidate` is the one table left out, and for a mechanical reason
-    rather than a judgement — see "What remains unverified".
+    `conflict_candidate` now has FORCE RLS that inherits parent `conflict`
+    visibility via EXISTS, and must not call `conflict_is_restricted` (that
+    function reads this table). Owner/audit roles keep `USING (true)` so the
+    SECURITY DEFINER walk still sees every candidate.
 
 11. **RLS policies are not scoped `TO procurement_app`** — with one deliberate
     exception, the `procurement_ingest` policies added under decision 22 below,

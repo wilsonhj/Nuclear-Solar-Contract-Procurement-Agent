@@ -4,7 +4,6 @@ Canonical schema -> multi-tab Excel writer with provenance and conditional
 formatting.
 """
 
-import json
 import os
 import re
 import tempfile
@@ -27,7 +26,7 @@ from ...schema import (
     ComponentInstance,
     ConflictStatus,
     WorkbookTab,
-    encode_value,
+    canonical_json,
 )
 
 #: plan.md Decision 8c. 1980-01-01 is the ZIP format's epoch floor; noon keeps
@@ -213,11 +212,12 @@ def write_workbook(
                     field_name,
                     _display(field.condition),
                     _display(field.value),
-                    field.unit,
+                    _safe_excel_text(field.unit) if field.unit is not None else None,
                     field.confidence,
                     ", ".join(sorted(flag.value for flag in cell_flags)),
-                    provenance,
+                    _safe_excel_text(provenance),
                 ]
+
                 sheet.append(row)
                 value_cell = sheet.cell(row=sheet.max_row, column=5)
                 value_cell.comment = Comment(provenance, DETERMINISTIC_APPLICATION)
@@ -256,9 +256,10 @@ def _style_header(cells: Iterable[Cell | MergedCell]) -> None:
 
 
 def _display(value: object) -> str:
-    return json.dumps(
-        encode_value(value), sort_keys=True, ensure_ascii=False, separators=(",", ":")
-    )
+    return canonical_json(value)
+
+
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "|", "\t", "\r", "\n", "\v", "\f")
 
 
 def _safe_excel_text(value: str) -> str:
@@ -266,17 +267,19 @@ def _safe_excel_text(value: str) -> str:
 
     Supplier and model names originate outside the application.  Excel and
     LibreOffice interpret cells beginning with ``=``, ``+``, ``-`` or ``@`` as
-    formulas, and tab/newline prefixes are also used to bypass shallow checks.
-    A leading apostrophe forces text semantics while preserving the visible
-    content in spreadsheet applications.
+    formulas, and tab/newline/whitespace prefixes are also used to bypass shallow
+    checks. A leading apostrophe forces text semantics while preserving the
+    visible content in spreadsheet applications.
     """
-    if value.startswith(("=", "+", "-", "@", "\t", "\r", "\n")):
+    if value.startswith(_FORMULA_PREFIXES) or value.lstrip().startswith(_FORMULA_PREFIXES):
         return "'" + value
     return value
 
 
-def _field_sort_key(field: CanonicalField) -> tuple[str, str, str]:
-    return (_display(field.condition), _display(field.value), _display(field.source_ref))
+def _field_sort_key(field: CanonicalField) -> str:
+    from .projection import _value_sort_key
+
+    return _value_sort_key(field)
 
 
 def _provenance_text(field: CanonicalField) -> str:
@@ -325,7 +328,7 @@ def _write_open_items(sheet: Worksheet, components: list[ComponentInstance]) -> 
     _style_header(sheet[1])
     for component in components:
         for field_name in component.unresolved_conflicts():
-            for field in component.fields[field_name]:
+            for field in sorted(component.fields[field_name], key=_field_sort_key):
                 if CellFlag.UNRESOLVED_CONFLICT in flags_for(field, confidence_threshold=0.0):
                     sheet.append(
                         [
@@ -364,14 +367,29 @@ def _write_cross_cutting(sheet: Worksheet, components: list[ComponentInstance], 
         "domestic_content_status",
         "domestic_content_percentage",
         "baba_status",
+        "baba_certification_ref",
         "feoc_pfe_status",
+        "country_of_origin",
+        "material_assistance_cost_ratio",
+    }
+    compliance_keys = {
+        "ercot_compliance_items",
+        "certifications",
+        "ul_listing",
+        "standards",
+        "ride_through_standards",
+        "fire_safety_certifications",
+        "cell_certification",
+        "pcs_certification",
+        "cybersecurity_standards",
+        "seismic_qualification",
     }
     for component in components:
         for field_name in sorted(component.fields):
-            include = field_name in tax_keys if topic == "tax" else field_name not in tax_keys
+            include = field_name in tax_keys if topic == "tax" else field_name in compliance_keys
             if not include:
                 continue
-            for field in component.fields[field_name]:
+            for field in sorted(component.fields[field_name], key=_field_sort_key):
                 sheet.append(
                     [
                         _safe_excel_text(component.supplier),

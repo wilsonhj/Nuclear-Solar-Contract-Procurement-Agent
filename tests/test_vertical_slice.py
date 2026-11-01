@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, LiteralString
@@ -16,13 +17,21 @@ from procurement_agent.schema import (
     Resolution,
     ResolutionAction,
     Severity,
+    SourceRef,
+    SourceTier,
     WorkbookTab,
 )
+from procurement_agent.services.claims import FieldClaim, reduce_field
+from procurement_agent.services.output import write_workbook
 from procurement_agent.services.output.projection import ProjectionPolicy
 from procurement_agent.services.vertical_slice import (
     InMemoryClaimStore,
+    PendingAuditEvent,
     SanitizedCSVError,
     VerticalSliceResult,
+    _candidate_key,
+    _new_audit_events,
+    _selected_claim_id,
     persist_vertical_slice,
     review_conflict,
     run_sanitized_pv_csv,
@@ -209,6 +218,11 @@ def test_a_review_after_persistence_emits_only_its_new_resolution_intent() -> No
     )
     reviewed = review_conflict(persisted, entry_id=conflict.entry_id, resolution=resolution)
 
+    human = [claim for claim in reviewed.claims if claim.extractor_version.startswith("human:")]
+    assert len(human) == 1
+    assert human[0].value == 655.0
+    assert human[0].resolution == resolution
+    assert human[0].extractor_version == "human:procurement.lead"
     assert [intent.event_type for intent in reviewed.audit_events] == ["resolution"]
     _, repersisted, events = persist_vertical_slice(
         conn,
@@ -423,3 +437,253 @@ def test_workbook_escapes_formula_shaped_supplier_and_model_text(tmp_path: Path)
     assert pv["A2"].value == "'=1+1"
     assert pv["B2"].value == "'+2+2"
     assert pv["A2"].data_type == pv["B2"].data_type == "s"
+
+
+def test_review_on_one_condition_group_preserves_resolution_when_another_is_open() -> None:
+    """CRITICAL-3: when a field has open conflicts in two separate condition
+
+    groups (`@STC` and `@NOCT`), resolving the `@STC` conflict first must keep
+    the `@STC` `CanonicalField` `RESOLVED` with its `Resolution` attached, while
+    leaving `@NOCT` `OPEN`."""
+    noct_rows = (
+        b"syn-pv-datasheet,file:///sanitized/example-solar-pv650-datasheet.pdf,spec_sheet,"
+        b"Example Solar Ltd.,PV-SAN-650,650,nameplate_power,490,Wp,490 Wp,noct,"
+        b"Electrical Data (NOCT),0.95\n"
+        b"syn-pv-purchase-order,file:///sanitized/example-solar-pv650-po.pdf,purchase_order,"
+        b"Example Solar Ltd.,PV-SAN-650,650,nameplate_power,505,Wp,505 Wp,noct,"
+        b"Commercial Schedule,0.92\n"
+    )
+    result = run_sanitized_pv_csv(
+        FIXTURE.read_bytes().rstrip() + b"\n" + noct_rows,
+        ingested_at=INGESTED_AT,
+        detected_at=DETECTED_AT,
+        actor="integration-test",
+    )
+    persisted, _ = _acknowledged(result)
+    assert len(persisted.conflicts) == 2
+
+    stc_conflict = next(
+        entry
+        for entry in persisted.conflicts
+        if entry.candidates[0].condition.basis is not None
+        and entry.candidates[0].condition.basis.value == "stc"
+    )
+    resolution = Resolution(
+        action=ResolutionAction.SELECT_VALUE,
+        resolved_by="procurement.lead",
+        resolved_at=datetime(2026, 8, 1, 10, 0, tzinfo=UTC),
+        rationale="Approve STC rating from PO.",
+        value_before=650.0,
+        value_after=655.0,
+    )
+    reviewed = review_conflict(persisted, entry_id=stc_conflict.entry_id, resolution=resolution)
+    by_basis = {
+        field.condition.basis.value if field.condition.basis else None: field
+        for field in reviewed.components[0].fields["nameplate_power"]
+    }
+    assert by_basis["stc"].conflict_status is ConflictStatus.RESOLVED
+    assert by_basis["stc"].resolution == resolution
+    assert by_basis["noct"].conflict_status is ConflictStatus.OPEN
+    assert by_basis["noct"].resolution is None
+
+
+def test_confidential_document_types_default_to_access_restricted() -> None:
+    """SEC-CRITICAL-1 (NFR-03 / D-15): purchase orders, contracts, pricing,
+    terms, and warranties are confidential by definition and must never default
+    to `access_restricted=False`."""
+    result = _run()
+    by_id = {source.document_id: source for source in result.sources}
+    assert by_id["syn-pv-datasheet"].access_restricted is False
+    assert by_id["syn-pv-purchase-order"].access_restricted is True
+
+
+def test_workbook_escapes_leading_whitespace_and_unit_formulas(tmp_path: Path) -> None:
+    """SEC-HIGH-1: leading whitespace before `=`, `+`, `-`, `@` or pipe `|` and
+    formula-shaped `unit` strings must be escaped with a leading apostrophe so
+    `openpyxl` never emits an executable `<f>` formula cell."""
+    result = _run()
+    comp = result.components[0]
+    mutated_fields = dict(comp.fields)
+    mutated_fields["nameplate_power"] = [comp.fields["nameplate_power"][0].evolve(unit="=SUM(1,2)")]
+    comp_with_bad_unit = comp.model_copy(
+        update={
+            "supplier": " =cmd|' /C calc'!A0",
+            "fields": mutated_fields,
+        }
+    )
+    workbook_path = write_workbook(
+        [comp_with_bad_unit],
+        tmp_path / "whitespace-formula-safe.xlsx",
+        confidence_threshold=0.8,
+    )
+    workbook = load_workbook(workbook_path, data_only=False)
+    pv = workbook[WorkbookTab.PV_MODULES.value]
+
+    assert pv["A2"].value == "' =cmd|' /C calc'!A0"
+    assert pv["A2"].data_type == "s"
+    assert pv["F3"].value == "'=SUM(1,2)"
+    assert pv["F3"].data_type == "s"
+
+
+def test_run_sanitized_pv_csv_returns_acknowledged_result_from_persist_callback() -> None:
+    """MEDIUM-10: when `persist` returns an acknowledged `VerticalSliceResult`
+    (with `audit_events=()`), `run_sanitized_pv_csv` returns that acknowledged
+    result so it can be passed directly into `review_conflict`."""
+    conn = _AuditConnection()
+
+    def persist_and_acknowledge(unpersisted: VerticalSliceResult) -> VerticalSliceResult:
+        _, acknowledged, _ = persist_vertical_slice(
+            conn,
+            unpersisted,
+            write=lambda connection, _: connection.execute("INSERT VERTICAL SLICE"),
+        )
+        return acknowledged
+
+    acknowledged = _run(persist=persist_and_acknowledge)
+    assert acknowledged.audit_events == ()
+
+    conflict = acknowledged.conflicts[0]
+    resolution = Resolution(
+        action=ResolutionAction.SELECT_VALUE,
+        resolved_by="procurement.lead",
+        resolved_at=datetime(2026, 8, 1, 10, 0, tzinfo=UTC),
+        rationale="The signed purchase order supersedes the draft datasheet.",
+        value_before=650.0,
+        value_after=655.0,
+    )
+    reviewed = review_conflict(acknowledged, entry_id=conflict.entry_id, resolution=resolution)
+    assert reviewed.conflicts[0].resolution == resolution
+    assert [event.event_type for event in reviewed.audit_events] == ["resolution"]
+
+
+def test_review_conflict_disambiguates_same_number_unit_normalization_with_candidate_unit() -> None:
+    """HIGH-7: resolving a UNIT_NORMALIZATION conflict where two candidates
+    share the same numeric value (650.0) and differ in unit ('W' vs 'kW')
+    succeeds when `candidate_unit='W'` is provided, and disambiguates
+    `_selected_claim_id` cleanly as well."""
+    base, _ = _acknowledged(_run())
+    claim_w = FieldClaim(
+        document_id="syn-pv-datasheet",
+        field_name="nameplate_power",
+        extractor_version="sanitized-pv-csv@1",
+        value=650.0,
+        unit="W",
+        verbatim_value="650 W",
+        source_tier=SourceTier.SYSTEM_OF_RECORD,
+        source_ref=SourceRef(document_id="syn-pv-datasheet", section="Electrical Data"),
+        confidence=0.95,
+    )
+    claim_kw = FieldClaim(
+        document_id="syn-pv-purchase-order",
+        field_name="nameplate_power",
+        extractor_version="sanitized-pv-csv@1",
+        value=650.0,
+        unit="kW",
+        verbatim_value="650 kW",
+        source_tier=SourceTier.SYSTEM_OF_RECORD,
+        source_ref=SourceRef(document_id="syn-pv-purchase-order", section="Schedule"),
+        confidence=0.92,
+    )
+    reduction = reduce_field(
+        (claim_w, claim_kw),
+        field_name="nameplate_power",
+        supplier=base.components[0].supplier,
+        model=base.components[0].model,
+        nameplate=base.components[0].nameplate,
+        detected_at=DETECTED_AT,
+    )
+    assert len(reduction.conflicts) == 1
+    unit_conflict = reduction.conflicts[0]
+    assert unit_conflict.conflict_class is ConflictClass.UNIT_NORMALIZATION
+
+    comp = base.components[0].model_copy(
+        update={
+            "fields": {
+                **base.components[0].fields,
+                "nameplate_power": list(reduction.fields),
+            }
+        }
+    )
+    slice_with_unit_conflict = replace(
+        base,
+        claims=(claim_w, claim_kw),
+        components=(comp,),
+        conflicts=reduction.conflicts,
+        audit_events=(),
+    )
+
+    resolution = Resolution(
+        action=ResolutionAction.SELECT_VALUE,
+        resolved_by="procurement.lead",
+        resolved_at=datetime(2026, 8, 1, 10, 0, tzinfo=UTC),
+        rationale="650 W is the correct module rating; 650 kW was a unit typo.",
+        value_before=650.0,
+        value_after=650.0,
+    )
+    with pytest.raises(ValueError, match="matches more than one eligible candidate"):
+        review_conflict(
+            slice_with_unit_conflict,
+            entry_id=unit_conflict.entry_id,
+            resolution=resolution,
+        )
+
+    reviewed = review_conflict(
+        slice_with_unit_conflict,
+        entry_id=unit_conflict.entry_id,
+        resolution=resolution,
+        candidate_unit="W",
+    )
+    resolved_field = reviewed.components[0].fields["nameplate_power"][0]
+    assert resolved_field.value == 650.0
+    assert resolved_field.unit == "W"
+    assert resolved_field.source_ref.document_id == "syn-pv-datasheet"
+    assert resolved_field.conflict_status is ConflictStatus.RESOLVED
+
+    candidate_claim_ids = {
+        _candidate_key(claim_w.as_candidate()): 101,
+        _candidate_key(claim_kw.as_candidate()): 202,
+    }
+    assert (
+        _selected_claim_id(
+            conflict=reviewed.conflicts[0],
+            candidate_claim_ids=candidate_claim_ids,
+            component=reviewed.components[0],
+        )
+        == 101
+    )
+
+
+def test_new_audit_events_selects_on_novelty_key_only() -> None:
+    """Blueprint #6: novelty is the explicit key, not a payload excavation."""
+    detected = PendingAuditEvent(
+        document_id="doc-a",
+        event_type="conflict_detected",
+        actor="test",
+        payload={"conflict": {"entry_id": "payload-must-be-ignored"}},
+        recorded_at=DETECTED_AT,
+        novelty_key="cf-new",
+    )
+    stale = PendingAuditEvent(
+        document_id="doc-a",
+        event_type="conflict_detected",
+        actor="test",
+        payload={"conflict": {"entry_id": "cf-new"}},
+        recorded_at=DETECTED_AT,
+        novelty_key="cf-old",
+    )
+    resolution = PendingAuditEvent(
+        document_id="doc-a",
+        event_type="resolution",
+        actor="test",
+        payload={"entry_id": "payload-must-be-ignored"},
+        recorded_at=DETECTED_AT,
+        novelty_key="cf-resolved",
+    )
+    selected = _new_audit_events(
+        (detected, stale, resolution),
+        new_document_ids=set(),
+        new_claim_document_ids=set(),
+        new_conflict_ids={"cf-new"},
+        new_resolution_entry_ids={"cf-resolved"},
+    )
+    assert [event.novelty_key for event in selected] == ["cf-new", "cf-resolved"]

@@ -142,16 +142,11 @@ CREATE TABLE audit.event (
     -- against trusting as a canonicalisation step.
     payload            jsonb GENERATED ALWAYS AS (payload_canonical::jsonb) STORED NOT NULL,
 
-    -- STALE DEFAULT, and deliberately left for now: D-13 section 4 requires the
-    -- CALLER to supply recorded_at (RFC 3339 UTC, Z offset, fixed microsecond
-    -- precision) because the value is hashed -- a defaulted timestamp cannot be
-    -- pre-computed by the caller, and a superuser could edit it without breaking
-    -- the chain. This DEFAULT must be DROPPED before the first emit, so that a
-    -- caller which forgets fails loudly on NOT NULL rather than silently
-    -- recording an unhashable timestamp that only surfaces at verification.
-    -- Not dropped here because Track 0 is documentation-only; it belongs to
-    -- WP-H's first schema change.
-    recorded_at        timestamptz NOT NULL DEFAULT clock_timestamp(),
+    -- D-13 section 4: the caller supplies recorded_at (RFC 3339 UTC, Z offset,
+    -- fixed microsecond precision) because the value is hashed. A DEFAULT would
+    -- let a forgotten caller insert an unhashable timestamp that only surfaces
+    -- at verification. NOT NULL with no default fails that caller at INSERT.
+    recorded_at        timestamptz NOT NULL,
 
     -- A genesis event (no parent) must be seq 0, and every non-genesis event
     -- must have a parent; this ties the two redundant ordering mechanisms
@@ -391,6 +386,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE audit_owner IN SCHEMA audit
 
 CREATE FUNCTION audit.reject_mutation() RETURNS trigger
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp
     AS $$
 BEGIN
     RAISE EXCEPTION
@@ -415,6 +411,7 @@ CREATE TRIGGER audit_event_no_mutation
 -- wording.
 CREATE FUNCTION audit.reject_truncate() RETURNS trigger
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp
     AS $$
 BEGIN
     RAISE EXCEPTION

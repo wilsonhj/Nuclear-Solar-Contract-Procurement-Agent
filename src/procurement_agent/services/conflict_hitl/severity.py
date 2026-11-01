@@ -41,6 +41,7 @@ from collections.abc import Sequence
 from decimal import Decimal
 
 from ...schema import ConflictCandidate, ConflictClass, Severity, SourceTier, ToleranceRule
+from ...schema.field import _comparable_unit
 from ..confidence import FIELD_TIERS, CriticalityTier
 from ..confidence import looks_tier_a as looks_tier_a
 from .tolerance import FieldTolerance, tolerance_for
@@ -360,7 +361,7 @@ def _scaled_numbers(candidates: Sequence[ConflictCandidate]) -> list[float] | No
         return None
     units = [c.unit for c in candidates]
     if all(unit is not None for unit in units):
-        bases = [_BASE_UNIT.get(unit.strip().casefold()) for unit in units if unit is not None]
+        bases = [_BASE_UNIT.get(_comparable_unit(unit) or "") for unit in units if unit is not None]
         if len(bases) == len(units) and all(base is not None for base in bases):
             families = {base[0] for base in bases if base is not None}
             if len(families) == 1:
@@ -427,8 +428,8 @@ def _reconciles(a: ConflictCandidate, b: ConflictCandidate, tolerance: FieldTole
         return False
     if a.value is None or b.value is None or a.unit is None or b.unit is None:
         return False
-    base_a = _BASE_UNIT.get(a.unit.strip().casefold())
-    base_b = _BASE_UNIT.get(b.unit.strip().casefold())
+    base_a = _BASE_UNIT.get(_comparable_unit(a.unit) or "")
+    base_b = _BASE_UNIT.get(_comparable_unit(b.unit) or "")
     if base_a is None or base_b is None or base_a[0] != base_b[0]:
         return False
     number_a, number_b = _numeric_value(a.value), _numeric_value(b.value)

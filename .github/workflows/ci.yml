@@ -49,16 +49,16 @@ jobs:
       # the tools were installed, then thrown away one step later.
       UV_PYTHON: ${{ matrix.python }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           enable-cache: true
 
       - name: Install dependencies
         id: install
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
 
       # `--no-sync` on every gate: without it `uv run` re-syncs to the *default*
       # environment, dropping `--extra dev` and taking the tools with it.
@@ -117,10 +117,10 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           enable-cache: true
 
@@ -128,7 +128,7 @@ jobs:
         # `store` brings pgvector alongside psycopg. The same `--no-sync` rule as
         # the job above applies to the run step below, and bites harder here: a
         # bare `uv run` would re-sync without either extra.
-        run: uv sync --extra dev --extra store
+        run: uv sync --locked --extra dev --extra store
 
       - name: Run the live-schema behaviour suite
         env:

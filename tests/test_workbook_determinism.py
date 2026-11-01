@@ -20,14 +20,26 @@ import zlib
 from pathlib import Path
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
+from procurement_agent.schema import (
+    CanonicalField,
+    ComponentCategory,
+    ComponentInstance,
+    Condition,
+    MeasurementBasis,
+    SourceRef,
+    SourceTier,
+    UnresolvedStatus,
+    WorkbookTab,
+)
 from procurement_agent.services import output as output_module
 from procurement_agent.services.output import (
     DETERMINISTIC_APPLICATION,
     DETERMINISTIC_COMPRESSLEVEL,
     DETERMINISTIC_TIMESTAMP,
     normalize_archive,
+    write_workbook,
 )
 
 
@@ -173,8 +185,6 @@ def test_library_version_is_not_embedded_in_the_output(tmp_path: Path) -> None:
 
 def test_normalized_workbook_still_opens_and_keeps_its_data(tmp_path: Path) -> None:
     """Determinism is worthless if it corrupts the file."""
-    from openpyxl import load_workbook
-
     book = normalize_archive(_write(tmp_path / "book.xlsx"))
     sheet = load_workbook(book).active
     assert sheet is not None
@@ -258,3 +268,135 @@ def test_a_foreign_workbook_with_different_part_casing_is_still_normalised(
         app = archive.read("docprops/App.XML").decode()
     assert "Openpyxl" not in app
     assert DETERMINISTIC_APPLICATION in app
+
+
+def test_write_workbook_bytes_do_not_depend_on_field_value_list_order(
+    tmp_path: Path,
+) -> None:
+    """FR-OUT-06 / AC-7: reversing a component's `fields[field_name]` list must
+    not change the bytes of any tab (`PV Modules`, `Conflicts & Open Items`,
+    `Compliance Matrix`, or `Tax Incentives`), even when two `CanonicalField`
+    entries share `(condition, value, source_ref)` and differ only in
+    `confidence` or `verbatim_value`."""
+    f1 = CanonicalField(
+        value=650.0,
+        unit="Wp",
+        verbatim_value="650 Wp (summary)",
+        condition=Condition(basis=MeasurementBasis.STC),
+        source_tier=SourceTier.SYSTEM_OF_RECORD,
+        source_ref=SourceRef(document_id="doc-1", page=1),
+        confidence=0.95,
+        unresolved_status=UnresolvedStatus.OPEN,
+    )
+    f2 = CanonicalField(
+        value=650.0,
+        unit="Wp",
+        verbatim_value="650.0 Wp (table)",
+        condition=Condition(basis=MeasurementBasis.STC),
+        source_tier=SourceTier.SYSTEM_OF_RECORD,
+        source_ref=SourceRef(document_id="doc-1", page=1),
+        confidence=0.85,
+        unresolved_status=UnresolvedStatus.OPEN,
+    )
+
+    c_forward = ComponentInstance(
+        supplier="Trina Solar",
+        model="TSM-650",
+        component_category=ComponentCategory.PV_MODULES,
+        fields={"nameplate_power": [f1, f2]},
+    )
+    c_reverse = ComponentInstance(
+        supplier="Trina Solar",
+        model="TSM-650",
+        component_category=ComponentCategory.PV_MODULES,
+        fields={"nameplate_power": [f2, f1]},
+    )
+
+    book_forward = write_workbook([c_forward], tmp_path / "forward.xlsx", confidence_threshold=0.80)
+    book_reverse = write_workbook([c_reverse], tmp_path / "reverse.xlsx", confidence_threshold=0.80)
+    assert book_forward.read_bytes() == book_reverse.read_bytes()
+
+
+def test_cross_cutting_tabs_route_only_compliance_and_tax_contract_keys(
+    tmp_path: Path,
+) -> None:
+    """LOW-13: Compliance Matrix must include only compliance contract keys
+    (e.g. certifications, ul_listing) and exclude engineering fields like
+    nameplate_power, while Tax Incentives must include all 7 tax/origin keys
+    including country_of_origin and baba_certification_ref."""
+    ref = SourceRef(document_id="doc-1", page=1)
+    pv_component = ComponentInstance(
+        supplier="Trina Solar",
+        model="TSM-650",
+        component_category=ComponentCategory.PV_MODULES,
+        fields={
+            "nameplate_power": [
+                CanonicalField(
+                    value=650.0,
+                    unit="Wp",
+                    condition=Condition(basis=MeasurementBasis.STC),
+                    source_tier=SourceTier.SYSTEM_OF_RECORD,
+                    source_ref=ref,
+                    confidence=0.95,
+                )
+            ],
+            "certifications": [
+                CanonicalField(
+                    value=["IEC 61215", "IEC 61730"],
+                    source_tier=SourceTier.SYSTEM_OF_RECORD,
+                    source_ref=ref,
+                    confidence=0.95,
+                )
+            ],
+            "country_of_origin": [
+                CanonicalField(
+                    value="Vietnam",
+                    source_tier=SourceTier.SYSTEM_OF_RECORD,
+                    source_ref=ref,
+                    confidence=0.95,
+                )
+            ],
+            "baba_certification_ref": [
+                CanonicalField(
+                    value="BABA-2026-001",
+                    source_tier=SourceTier.SYSTEM_OF_RECORD,
+                    source_ref=ref,
+                    confidence=0.95,
+                )
+            ],
+        },
+    )
+    cable_component = ComponentInstance(
+        supplier="Southwire",
+        model="PV-WIRE-10AWG",
+        component_category=ComponentCategory.CABLING_WIRING,
+        fields={
+            "ul_listing": [
+                CanonicalField(
+                    value="UL 4703",
+                    source_tier=SourceTier.SYSTEM_OF_RECORD,
+                    source_ref=ref,
+                    confidence=0.95,
+                )
+            ],
+        },
+    )
+
+    workbook_path = write_workbook(
+        [pv_component, cable_component], tmp_path / "routing.xlsx", confidence_threshold=0.80
+    )
+    workbook = load_workbook(workbook_path)
+
+    compliance_sheet = workbook[WorkbookTab.COMPLIANCE_MATRIX.value]
+    compliance_fields = [
+        compliance_sheet.cell(row=row_idx, column=3).value
+        for row_idx in range(2, compliance_sheet.max_row + 1)
+    ]
+    assert set(compliance_fields) == {"certifications", "ul_listing"}
+    assert "nameplate_power" not in compliance_fields
+
+    tax_sheet = workbook[WorkbookTab.TAX_INCENTIVES.value]
+    tax_fields = [
+        tax_sheet.cell(row=row_idx, column=3).value for row_idx in range(2, tax_sheet.max_row + 1)
+    ]
+    assert tax_fields == ["baba_certification_ref", "country_of_origin"]

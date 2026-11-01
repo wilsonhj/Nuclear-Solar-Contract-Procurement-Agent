@@ -287,3 +287,62 @@ def test_resolving_a_band_cannot_manufacture_an_infinite_range() -> None:
     assert all(map(math.isfinite, wide.resolve(1e300, nominal_unit="W")))
     # Ordinary magnitudes are untouched.
     assert band.resolve(650.0, nominal_unit="W") == pytest.approx((630.5, 669.5))
+
+
+def test_declared_band_agrees_across_kelvin_and_celsius_rate_aliases() -> None:
+    """D-5: `%/degC`, `%/K`, and `%/°C` are spellings of the same unit interval.
+    `_comparable_unit` in `schema/field.py` must fold them just like
+    `conflict_hitl._normalise_unit` does, and `values_conflict` on
+    `nameplate_power` must honour an explicit `band_a`/`band_b` without requiring
+    the caller to pass `FIELD_TOLERANCES['power_tolerance']`."""
+    from procurement_agent.services.conflict_hitl import tolerance_for, values_conflict
+
+    coeff_band = DeclaredBand(low=-0.02, high=0.02, kind=ToleranceKind.ABSOLUTE, unit="%/degC")
+    assert coeff_band.agrees(-0.29, None, -0.30, nominal_unit="%/degC", other_unit="%/K")
+
+    a = ConflictCandidate(
+        value=650.0,
+        unit="W",
+        source_tier=SourceTier.SYSTEM_OF_RECORD,
+        source_ref=SourceRef(document_id="datasheet"),
+        confidence=0.95,
+    )
+    b = ConflictCandidate(
+        value=654.0,
+        unit="W",
+        source_tier=SourceTier.SYSTEM_OF_RECORD,
+        source_ref=SourceRef(document_id="contract"),
+        confidence=0.95,
+    )
+    verdict = values_conflict(
+        a,
+        b,
+        field_name="nameplate_power",
+        tolerance=tolerance_for("nameplate_power"),
+        band_a=TRINA,
+    )
+    assert not verdict.conflicts
+
+    # And comparing two `DeclaredBand` candidates directly on `power_tolerance`
+    # must never embed `<ToleranceKind...>` enum reprs in `verdict.reason`.
+    band_cand_a = ConflictCandidate(
+        value=TRINA,
+        unit=None,
+        source_tier=SourceTier.SYSTEM_OF_RECORD,
+        source_ref=SourceRef(document_id="d1"),
+        confidence=0.9,
+    )
+    band_cand_b = ConflictCandidate(
+        value=CANADIAN,
+        unit=None,
+        source_tier=SourceTier.SYSTEM_OF_RECORD,
+        source_ref=SourceRef(document_id="d2"),
+        confidence=0.9,
+    )
+    band_verdict = values_conflict(
+        band_cand_a,
+        band_cand_b,
+        field_name="power_tolerance",
+        tolerance=tolerance_for("power_tolerance"),
+    )
+    assert "<" not in band_verdict.reason

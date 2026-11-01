@@ -37,6 +37,7 @@ from procurement_agent.services.claims import (
     canonical_claims,
     commit_claims,
     project,
+    reduce_field,
     takes_a_write_handle,
 )
 from procurement_agent.services.conflict_hitl import AutonomousOverwriteError, comparison_pairs
@@ -1022,3 +1023,145 @@ def test_field_claim_still_forbids_an_undeclared_key() -> None:
             confidence=0.9,
             verbatim_valeu="650",  # type: ignore[call-arg]
         )
+
+
+def test_project_agrees_with_values_conflict_on_d2_tolerance_and_unit_aliases() -> None:
+    """CRITICAL-2: `_status_for` used `values_conflict` only for `SET_EQUAL` and
+    fell back to exact `_asserted` string/unit equality for every other rule.
+    Claims agreeing within D-2's numeric band (`650.0 Wp` vs `650.4 Wp` on
+    `nameplate_power` ±1.0 Wp) or D-5's unit aliases (`%/degC` vs `%/K` on
+    `temp_coeff_pmax`) were marked `ConflictStatus.OPEN` by `project()` while
+    `values_conflict` returned `conflicts=False`, creating unresolvable ghost
+    OPEN fields with zero queue entries."""
+    within_band = project(
+        [
+            _claim(650.0, doc="contract", unit="Wp", verbatim="650.0 Wp"),
+            _claim(650.4, doc="datasheet", unit="Wp", verbatim="650.4 Wp"),
+        ]
+    )
+    assert [f.conflict_status for f in within_band] == [ConflictStatus.NONE]
+
+    aliased_units = project(
+        [
+            _claim(-0.29, doc="contract", field="temp_coeff_pmax", unit="%/degC"),
+            _claim(-0.29, doc="datasheet", field="temp_coeff_pmax", unit="%/K"),
+        ]
+    )
+    assert [f.conflict_status for f in aliased_units] == [ConflictStatus.NONE]
+
+    # And within a single document/extractor, printing `%/degC` in a summary and
+    # `%/K` in a table is one assertion, not a ProposalError.
+    same_doc_aliases = canonical_claims(
+        [
+            _claim(-0.29, doc="datasheet", field="temp_coeff_pmax", unit="%/degC", page=1),
+            _claim(-0.29, doc="datasheet", field="temp_coeff_pmax", unit="%/K", page=4),
+        ]
+    )
+    assert len(same_doc_aliases) == 2
+
+
+def test_missing_vs_populated_on_set_equal_field_is_still_open() -> None:
+    """CRITICAL-2: on `SET_EQUAL` fields (`certifications`, `ul_listing`),
+    `_status_for` delegated to `values_conflict`, which returns `conflicts=False`
+    when either side is `None`. So `[None, ['UL 1741']]` returned `NONE` on a
+    Tier A CRITICAL field while scalar fields returned `OPEN`."""
+    projected = project(
+        [
+            _claim(None, doc="a-datasheet", field="certifications", unit=None),
+            _claim(["UL 1741"], doc="b-datasheet", field="certifications", unit=None),
+        ]
+    )
+    assert len(projected) == 1
+    assert projected[0].value == ["UL 1741"]
+    assert projected[0].conflict_status is ConflictStatus.OPEN
+
+
+def test_claim_identity_distinguishes_none_from_empty_and_condition_notes() -> None:
+    """HIGH-6: `_identity` folded `None` and `""` on `unit`/`verbatim_value` and
+    dropped `condition.note`/`condition.derived`, causing distinct claims to
+    collide in `canonical_claims` and making the surviving claim depend on
+    arrival order."""
+    c_none = _claim(650.0, doc="d1", verbatim=None)
+    c_empty = _claim(650.0, doc="d1", verbatim="")
+    assert len(canonical_claims([c_none, c_empty])) == 2
+
+    c_note_a = _claim(
+        650.0,
+        doc="d1",
+        condition=Condition(basis=MeasurementBasis.STC, note="note A"),
+    )
+    c_note_b = _claim(
+        650.0,
+        doc="d1",
+        condition=Condition(basis=MeasurementBasis.STC, note="note B"),
+    )
+    assert len(canonical_claims([c_note_a, c_note_b])) == 2
+
+
+def test_field_claim_rejects_non_finite_value_at_construction() -> None:
+    """LOW-12: `FieldClaim.value` must reject NaN/Infinity at construction."""
+    with pytest.raises(ValidationError, match="non-finite"):
+        _claim(float("nan"))
+
+
+def test_reduce_field_unifies_projection_conflict_detection_and_cross_condition_stamping() -> None:
+    """Candidate 1: `reduce_field` returns both stamped `CanonicalField`s and
+    `ConflictQueueEntry` rows in one call without manual `stamp_queue_hits`
+    plumbing."""
+    unstated = _claim(650.0, doc="doc-a", condition=Condition())
+    stated = _claim(
+        700.0,
+        doc="doc-b",
+        condition=Condition(basis=MeasurementBasis.STC),
+        tier=SourceTier.WEB_SUPPLEMENT,
+    )
+    reduction = reduce_field(
+        [unstated, stated],
+        field_name="nameplate_power",
+        supplier="Example Solar Ltd.",
+        model="PV-SAN-650",
+        nameplate=650.0,
+        detected_at=datetime(2026, 8, 1, 9, 1, tzinfo=UTC),
+    )
+    assert len(reduction.fields) == 2
+    assert {f.conflict_status for f in reduction.fields} == {ConflictStatus.OPEN}
+    assert len(reduction.conflicts) == 1
+    assert reduction.conflicts[0].field_name == "nameplate_power"
+
+
+def test_reduce_field_entry_id_includes_component_identity() -> None:
+    """MEDIUM-9: the same field/pair on two SKUs must not share an entry_id."""
+    unstated = _claim(650.0, doc="doc-a", condition=Condition())
+    stated = _claim(
+        700.0,
+        doc="doc-b",
+        condition=Condition(basis=MeasurementBasis.STC),
+        tier=SourceTier.WEB_SUPPLEMENT,
+    )
+    detected_at = datetime(2026, 8, 1, 9, 1, tzinfo=UTC)
+    first = reduce_field(
+        [unstated, stated],
+        field_name="nameplate_power",
+        supplier="Example Solar Ltd.",
+        model="PV-SAN-650",
+        nameplate=650.0,
+        detected_at=detected_at,
+    )
+    second = reduce_field(
+        [unstated, stated],
+        field_name="nameplate_power",
+        supplier="Other Solar Ltd.",
+        model="PV-SAN-700",
+        nameplate=700.0,
+        detected_at=detected_at,
+    )
+    same = reduce_field(
+        [unstated, stated],
+        field_name="nameplate_power",
+        supplier="Example Solar Ltd.",
+        model="PV-SAN-650",
+        nameplate=650.0,
+        detected_at=detected_at,
+    )
+    assert first.conflicts[0].entry_id != second.conflicts[0].entry_id
+    assert first.conflicts[0].entry_id == same.conflicts[0].entry_id
