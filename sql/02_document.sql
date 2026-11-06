@@ -38,6 +38,15 @@ CREATE TABLE public.document (
     -- retrieval time, not only at the API edge.
     access_restricted boolean NOT NULL DEFAULT false,
 
+    -- The same ratchet as SourceDocument (enums.RESTRICTED_DOCUMENT_TYPES):
+    -- a confidential document type is never stored unrestricted, whichever
+    -- writer inserts it.
+    CONSTRAINT document_confidential_types_restricted CHECK (
+        access_restricted OR document_type NOT IN (
+            'contract_tos', 'purchase_order', 'pricing', 'terms_and_conditions', 'warranty'
+        )
+    ),
+
     -- NFR-05 / AC-5, and the exact gap docs/agent-topology.md:34 names:
     -- "content_hash is the intended dedup key ... but it is an unconstrained
     -- field today ... a retry after a partial commit can still duplicate.

@@ -468,9 +468,11 @@ def _status_for(group: Sequence[FieldClaim]) -> ConflictStatus:
     real disagreement in this domain, and dropping the `None` first made it
     invisible.
 
-    Over `_asserted` and pairwise `values_conflict` (for comparable rules), so
-    `project()` agrees with D-2 tolerances and D-5 unit aliases and never flags a
-    ghost OPEN conflict that the detector would not queue.
+    Over `_asserted` and pairwise `values_conflict` (for comparable rules), so a
+    disagreement the D-2 tolerances or D-5 unit aliases absorb is not flagged.
+    Two cases are OPEN here with no queue entry from `reduce_field`: a
+    missing-vs-present group (a gap, not a value conflict) and a `NEVER_COMPARE`
+    field with differing answers.
     """
     if _human_decision(group) is not None:
         # D-16: a reviewer's decision settles the group. A later extraction that
@@ -618,17 +620,12 @@ def project(claims: Sequence[FieldClaim]) -> list[CanonicalField]:
 def stamp_queue_hits(
     fields: Sequence[CanonicalField],
     pairs: Sequence[tuple[ConflictCandidate, ConflictCandidate]],
-    *,
-    clear_absent: bool = False,
 ) -> list[CanonicalField]:
     """Copy cross-condition queue hits onto the matching `CanonicalField`s.
 
     `project()` statuses only inside a `grouping_key()`. `comparison_pairs`
     still compares unstated vs stated (D-1). Without this copy, the queue sees
     the disagreement and `flags_for` / C6 / Open Items do not.
-
-    `clear_absent` drops a stamp after the last queue pair involving that
-    condition is resolved, so a sequential review does not leave a ghost OPEN.
     """
     involved = {
         candidate.condition.grouping_key() for left, right in pairs for candidate in (left, right)
@@ -639,13 +636,6 @@ def stamp_queue_hits(
         status = field.conflict_status
         if key in involved and status is ConflictStatus.NONE:
             stamped.append(field.evolve(conflict_status=ConflictStatus.OPEN))
-        elif (
-            clear_absent
-            and key not in involved
-            and status is ConflictStatus.OPEN
-            and field.resolution is None
-        ):
-            stamped.append(field.evolve(conflict_status=ConflictStatus.NONE))
         else:
             stamped.append(field)
     return stamped
@@ -712,6 +702,7 @@ def reduce_field(
                     detected_at=detected_at,
                 )
             )
+    entries = [_settled_by_human(entry, ordered) for entry in entries]
     open_pairs = [
         (entry.candidates[0], entry.candidates[1])
         for entry in entries
@@ -719,6 +710,30 @@ def reduce_field(
     ]
     stamped = stamp_queue_hits(projected, open_pairs)
     return FieldReduction(fields=tuple(stamped), conflicts=tuple(entries))
+
+
+def _settled_by_human(
+    entry: ConflictQueueEntry, claims: Sequence[FieldClaim]
+) -> ConflictQueueEntry:
+    """Attach the decision that settles this entry's group, if a reviewer made one.
+
+    D-16: a human claim settles its condition group, and a settled group stays
+    settled. So an entry with a candidate in that group carries the decision -
+    the latest `resolved_at` when there are several - and re-reducing the store
+    after a review never reports the reviewed pair as pending again.
+    """
+    keys = {candidate.condition.grouping_key() for candidate in entry.candidates}
+    decisions = [
+        claim.resolution
+        for claim in claims
+        if claim.is_human
+        and claim.resolution is not None
+        and claim.condition.grouping_key() in keys
+    ]
+    if not decisions or entry.resolution is not None:
+        return entry
+    latest = max(decisions, key=lambda resolution: resolution.resolved_at)
+    return entry.model_copy(update={"resolution": latest})
 
 
 def commit_claims(

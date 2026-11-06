@@ -61,7 +61,7 @@ A pairwise disagreement between two condition-compatible **Conflict Candidates**
 _Avoid_: ticket, alert, diff
 
 **Severity**:
-A discrete criticality classification (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`) governing review priority and whether an unresolved **Conflict Queue Entry** blocks workbook composition.
+A discrete criticality classification (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFORMATIONAL`) governing review priority and whether an unresolved **Conflict Queue Entry** blocks workbook composition.
 _Avoid_: risk score, confidence weight
 
 **Resolution**:
@@ -79,5 +79,5 @@ The deterministic, content-hashed JSON representation of all **Component Instanc
 _Avoid_: dump, snapshot, cache
 
 **Audit Stream**:
-A per-document (or per-run) cryptographic hash chain of immutable lifecycle events (`document_ingested`, `extraction`, `conflict_detected`, `resolution`, `compose`, `attempt_failed`) serialized in canonical JSON.
+A per-document cryptographic hash chain of immutable lifecycle events (`document_ingested`, `parse_failure`, `extraction`, `web_search`, `conflict_detected`, `resolution`, `attempt_failed`) serialized in canonical JSON. Run-scoped streams and compose events are planned (D-13), not yet stored.
 _Avoid_: application log, trace

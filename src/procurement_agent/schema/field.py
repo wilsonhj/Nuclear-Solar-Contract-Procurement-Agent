@@ -224,29 +224,47 @@ class DeclaredBandUnitError(ValueError):
     """
 
 
-_RATE_UNIT_ALIASES: dict[str, str] = {
+#: Unit spellings the frozen contract declares to be **one unit** (D-5), folded to a
+#: single form. Not a conversion table: `%/degC` and `%/K` are one quantity as a
+#: per-degree interval and need no arithmetic. `conflict_hitl` documents why.
+UNIT_ALIASES: dict[str, str] = {
     "%/k": "%/degc",
     "%/°c": "%/degc",
 }
 
+_SLASH_SPACING = re.compile(r"\s*/\s*")
+
+
+def normalise_unit(value: str) -> str:
+    """A unit folded to its comparable form: the one folding rule in this repo.
+
+    NFKC, internal whitespace and case, with one exception to case: a leading
+    `M` before a letter stays upper case, because `MWh` (mega) and `mWh` (milli)
+    are a factor of 10^9 apart and casefolding both to `mwh` would absorb the
+    unit conflict FR-ING-08 says tolerance never absorbs.
+
+    The slash-spacing collapse is applied *only* to build the alias lookup key:
+    a spelling that is not an alias comes back uncollapsed, so `USD / W` against
+    `USD/W` is still a unit conflict. Widening this into "units that look alike
+    are alike" is the direction D-2 forbids.
+    """
+    text = " ".join(unicodedata.normalize("NFKC", value).split())
+    folded = text.casefold()
+    if len(text) > 1 and text[0] == "M" and text[1].isalpha():
+        folded = "M" + folded[1:]
+    return UNIT_ALIASES.get(_SLASH_SPACING.sub("/", folded), folded)
+
 
 def _comparable_unit(value: str | None) -> str | None:
-    """A unit folded for equality, the way `conflict_hitl._normalise_unit` folds
-    one: NFKC, case, internal whitespace, slash spacing, and D-5's rate aliases.
+    """`normalise_unit`, with an empty spelling read as no unit.
 
-    Spelling only. `w` and `W` are one unit; `W` and `Wp` are not, and neither
-    are `W` and `kW`. Deciding that two differently-spelled units name one
-    quantity is a technical claim, and the one place this repo makes such a claim
-    - `%/degC` against `%/K` - is shared here so `DeclaredBand` agrees with
-    `values_conflict` (D-5).
+    Shared with `conflict_hitl.values_conflict` so `DeclaredBand` and the
+    conflict judge agree on what counts as one unit (D-5).
     """
     if value is None:
         return None
-    folded = " ".join(unicodedata.normalize("NFKC", value).casefold().split())
-    if not folded:
-        return None
-    compact = "/".join(part.strip() for part in folded.split("/"))
-    return _RATE_UNIT_ALIASES.get(compact, compact)
+    folded = normalise_unit(value)
+    return folded or None
 
 
 class DeclaredBand(BaseModel):
@@ -776,8 +794,9 @@ def _reject_non_finite_value(value: object, _containers: tuple[int, ...] = ()) -
 
     Nested `BaseModel`s are left to their own validators - `DeclaredBand` already
     rejects a non-finite bound, and re-checking it here would be a second
-    statement of a rule that has a home. A cycle guard prevents infinite
-    recursion on self-referential containers before they reach `encode_value`.
+    statement of a rule that has a home. A cycle guard stops this walk from
+    recursing forever on a self-referential container; such a value is accepted
+    here and still fails at `encode_value`.
     """
     if isinstance(value, bool):  # before the numeric branch - bool is an int
         return value

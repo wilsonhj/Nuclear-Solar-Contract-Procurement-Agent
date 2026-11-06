@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import re
 from collections.abc import Sequence
 from decimal import Decimal
 
@@ -317,14 +318,14 @@ def _band(tolerance: FieldTolerance, numbers: Sequence[float]) -> float | None:
 _BASE_UNIT: dict[str, tuple[str, float]] = {
     "w": ("w", 1.0),
     "kw": ("w", 1e3),
-    "mw": ("w", 1e6),
+    "Mw": ("w", 1e6),
     "gw": ("w", 1e9),
     "va": ("va", 1.0),
     "kva": ("va", 1e3),
-    "mva": ("va", 1e6),
+    "Mva": ("va", 1e6),
     "wh": ("wh", 1.0),
     "kwh": ("wh", 1e3),
-    "mwh": ("wh", 1e6),
+    "Mwh": ("wh", 1e6),
     "gwh": ("wh", 1e9),
     "v": ("v", 1.0),
     "kv": ("v", 1e3),
@@ -335,6 +336,18 @@ _BASE_UNIT: dict[str, tuple[str, float]] = {
     "%": ("%", 1.0),
     "fraction": ("%", 100.0),
 }
+
+
+def _base_unit(unit: str | None) -> tuple[str, float] | None:
+    """The `_BASE_UNIT` family of a unit, ignoring slash spacing.
+
+    Only for severity's scale checks: `normalise_unit` keeps `USD / W` distinct
+    from `USD/W` for the conflict decision, but both are one family here.
+    """
+    comparable = _comparable_unit(unit)
+    if comparable is None:
+        return None
+    return _BASE_UNIT.get(re.sub(r"\s*/\s*", "/", comparable))
 
 
 def _scaled_numbers(candidates: Sequence[ConflictCandidate]) -> list[float] | None:
@@ -361,7 +374,7 @@ def _scaled_numbers(candidates: Sequence[ConflictCandidate]) -> list[float] | No
         return None
     units = [c.unit for c in candidates]
     if all(unit is not None for unit in units):
-        bases = [_BASE_UNIT.get(_comparable_unit(unit) or "") for unit in units if unit is not None]
+        bases = [_base_unit(unit) for unit in units if unit is not None]
         if len(bases) == len(units) and all(base is not None for base in bases):
             families = {base[0] for base in bases if base is not None}
             if len(families) == 1:
@@ -428,8 +441,8 @@ def _reconciles(a: ConflictCandidate, b: ConflictCandidate, tolerance: FieldTole
         return False
     if a.value is None or b.value is None or a.unit is None or b.unit is None:
         return False
-    base_a = _BASE_UNIT.get(_comparable_unit(a.unit) or "")
-    base_b = _BASE_UNIT.get(_comparable_unit(b.unit) or "")
+    base_a = _base_unit(a.unit)
+    base_b = _base_unit(b.unit)
     if base_a is None or base_b is None or base_a[0] != base_b[0]:
         return False
     number_a, number_b = _numeric_value(a.value), _numeric_value(b.value)

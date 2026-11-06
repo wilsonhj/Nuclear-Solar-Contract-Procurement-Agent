@@ -80,6 +80,7 @@ def test_the_expected_files_are_all_present() -> None:
         "07_audit_event.sql",
         "08_job.sql",
         "09_claim_natural_key_condition.sql",
+        "09a_hardening_catch_up.sql",
     ]
 
 

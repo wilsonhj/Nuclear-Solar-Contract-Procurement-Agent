@@ -9,7 +9,9 @@ Stage 1 exit condition, so they belong in a follow-up rather than in scaffolding
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import datetime
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -76,6 +78,24 @@ class SourceDocument(BaseModel):
         if self.document_type in RESTRICTED_DOCUMENT_TYPES and not self.access_restricted:
             object.__setattr__(self, "access_restricted", True)
         return self
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Re-validate a copy that changes fields, so the ratchet above still holds.
+
+        Stock `model_copy(update=...)` writes `__dict__` with no validator, which
+        would let a pricing document be copied out as `access_restricted=False`.
+        """
+        if update is None:
+            return super().model_copy(deep=deep)
+        return type(self).model_validate({**super().model_copy(deep=deep).__dict__, **update})
+
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:
+        """Build without validation, but never as an unrestricted confidential type."""
+        built = super().model_construct(_fields_set, **values)
+        if built.document_type in RESTRICTED_DOCUMENT_TYPES and not built.access_restricted:
+            object.__setattr__(built, "access_restricted", True)
+        return built
 
 
 class ComponentInstance(BaseModel):

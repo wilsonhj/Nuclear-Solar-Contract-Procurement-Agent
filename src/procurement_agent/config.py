@@ -75,6 +75,8 @@ class Settings(BaseSettings):
         if value is None:
             return None
         parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("endpoint URL must be an absolute http(s) URL with a host")
         if parsed.username is not None or parsed.password is not None:
             raise ValueError(
                 "endpoint URL must not contain embedded userinfo credentials; "

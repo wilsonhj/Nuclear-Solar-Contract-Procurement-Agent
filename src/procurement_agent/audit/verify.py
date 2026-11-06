@@ -522,6 +522,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         # sql/07: the verifier runs as an operator identity that sets this,
         # "exactly as the confidentiality model intends".
         conn.execute("SET app.allow_restricted = 'true'")
+        # The GUC cannot lift `audit_event_app_never_restricted`, so a run as the
+        # serving identity would skip every restricted stream and still print OK.
+        # Refuse it rather than verify a subset and call it everything.
+        hidden = conn.execute(
+            """
+            SELECT NOT r.rolsuper
+                   AND pg_catalog.pg_has_role(current_user, 'procurement_app', 'MEMBER')
+              FROM pg_catalog.pg_roles r
+             WHERE r.rolname = current_user
+               AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'procurement_app')
+            """
+        ).fetchone()
+        if hidden is not None and hidden[0]:
+            print(
+                "error: the verifier is connected as procurement_app, which cannot see "
+                "restricted streams; connect as an operator identity entitled to them."
+            )
+            return 2
         requested = list(args.streams or ())
         streams = requested or read_streams(conn)
 

@@ -123,8 +123,11 @@ ALTER TABLE public.conflict_candidate FORCE ROW LEVEL SECURITY;
 --
 -- `procurement_owner` / `audit_owner` get USING (true) so the SECURITY DEFINER
 -- walk inside `conflict_is_restricted` still sees every candidate row under
--- FORCE RLS. Without that owner policy the EXISTS-on-conflict SELECT would
--- re-enter `conflict_is_restricted` and recurse.
+-- FORCE RLS. Without that owner policy no policy applies to the owner, FORCE
+-- RLS default-denies, the walk sees no candidates, and every conflict reads as
+-- unrestricted - failing open. The EXISTS policy below cannot stand in: it is
+-- scoped to procurement_app, and a PUBLIC version would apply inside the walk
+-- and re-enter `conflict_is_restricted`.
 CREATE POLICY conflict_candidate_owner ON public.conflict_candidate
     FOR ALL TO procurement_owner, audit_owner
     USING (true)

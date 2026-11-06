@@ -13,7 +13,7 @@ import csv
 import hashlib
 import io
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +26,6 @@ from ..schema import (
     Condition,
     ConflictCandidate,
     ConflictQueueEntry,
-    ConflictStatus,
     DocumentType,
     MeasurementBasis,
     Resolution,
@@ -274,6 +273,11 @@ def run_sanitized_pv_csv(
         acknowledged = persist(result)
         if isinstance(acknowledged, VerticalSliceResult):
             return acknowledged
+        if acknowledged is not None:
+            raise TypeError(
+                "persist must return the acknowledged VerticalSliceResult or None, "
+                f"not {type(acknowledged).__name__}"
+            )
     return result
 
 
@@ -467,7 +471,7 @@ def write_vertical_slice_rows(
         selected_claim_id = _selected_claim_id(
             conflict=conflict,
             candidate_claim_ids=candidate_claim_ids,
-            component=component,
+            claims=result.claims,
         )
         existing_resolution_id = _find_existing_resolution_id(
             conn,
@@ -560,8 +564,9 @@ def _existing_claim_id(
            AND nameplate IS NOT DISTINCT FROM %s
            AND field = %s AND extractor_version = %s
            AND value = %s::jsonb AND unit IS NOT DISTINCT FROM %s
+           AND verbatim_value IS NOT DISTINCT FROM %s
            AND condition = %s::jsonb AND source_tier = %s
-         ORDER BY claim_id LIMIT 1
+           AND source_ref = %s::jsonb AND confidence = %s
         """,
         (
             claim.document_id,
@@ -573,8 +578,11 @@ def _existing_claim_id(
             claim.extractor_version,
             _json(claim.value),
             claim.unit,
+            claim.verbatim_value,
             _json(claim.condition),
             claim.source_tier.value,
+            _json(claim.provenance()),
+            claim.confidence,
         ),
     ).fetchone()
     if row is None:
@@ -650,8 +658,14 @@ def _selected_claim_id(
     *,
     conflict: ConflictQueueEntry,
     candidate_claim_ids: dict[str, int],
-    component: ComponentInstance | None = None,
+    claims: Sequence[FieldClaim],
 ) -> int | None:
+    """The stored candidate claim a value-selecting resolution chose.
+
+    Read from the human claim that carries the decision (D-16 point 8: its
+    provenance *is* the selected candidate's), never from the component's
+    current fields, which a later review of the same field changes.
+    """
     resolution = conflict.resolution
     assert resolution is not None
     if resolution.action not in {
@@ -659,34 +673,21 @@ def _selected_claim_id(
         ResolutionAction.KEEP_SYSTEM_OF_RECORD,
     }:
         return None
+    deciding = [claim for claim in claims if claim.is_human and claim.resolution == resolution]
     matching_candidates = [
         candidate
         for candidate in conflict.candidates
-        if _values_match(candidate.value, resolution.value_after)
-        and (
-            resolution.action is ResolutionAction.SELECT_VALUE
-            or candidate.source_tier is SourceTier.SYSTEM_OF_RECORD
+        if any(
+            _values_match(candidate.value, claim.value)
+            and candidate.unit == claim.unit
+            and candidate.source_ref == claim.source_ref
+            for claim in deciding
         )
     ]
-    if len(matching_candidates) > 1 and component is not None:
-        fields_for_key = component.fields.get(conflict.field_name, [])
-        preferred_fields = [
-            field for field in fields_for_key if field.resolution == resolution
-        ] or fields_for_key
-        matching_candidates = [
-            candidate
-            for candidate in matching_candidates
-            if any(
-                _values_match(candidate.value, field.value)
-                and candidate.unit == field.unit
-                and candidate.source_ref == field.source_ref
-                for field in preferred_fields
-            )
-        ]
     matches = [candidate_claim_ids[_candidate_key(candidate)] for candidate in matching_candidates]
-    if len(matches) != 1:
+    if len(matches) > 1:
         raise ValueError("a stored candidate resolution must identify exactly one claim")
-    return matches[0]
+    return matches[0] if matches else None
 
 
 def _candidate_key(candidate: ConflictCandidate) -> str:
@@ -753,58 +754,13 @@ def review_conflict(
         )
     selected = selected_candidates[0]
 
-    resolved_entry = target.model_copy(update={"resolution": resolution})
-    components: list[ComponentInstance] = []
-    for component in result.components:
-        if component.supplier != target.supplier or component.model != target.model:
-            components.append(component)
-            continue
-        fields = {name: list(values) for name, values in component.fields.items()}
-        current = fields[target.field_name]
-        remaining_pairs = [
-            (entry.candidates[0], entry.candidates[1])
-            for entry in result.conflicts
-            if entry.entry_id != entry_id
-            and entry.resolution is None
-            and entry.supplier == target.supplier
-            and entry.model == target.model
-            and entry.field_name == target.field_name
-            and len(entry.candidates) >= 2
-        ]
-        involved_remaining = {
-            candidate.condition.grouping_key()
-            for left, right in remaining_pairs
-            for candidate in (left, right)
-        }
-        selected_key = selected.condition.grouping_key()
-        still_open = selected_key in involved_remaining
-        fields[target.field_name] = [
-            field.evolve(
-                value=selected.value,
-                unit=selected.unit,
-                verbatim_value=selected.verbatim_value,
-                condition=selected.condition,
-                source_tier=selected.source_tier,
-                source_ref=selected.source_ref,
-                confidence=selected.confidence,
-                conflict_status=(ConflictStatus.OPEN if still_open else ConflictStatus.RESOLVED),
-                resolution=None if still_open else resolution,
-            )
-            if field.condition.grouping_key() == selected_key
-            else field
-            for field in current
-        ]
-        fields[target.field_name] = stamp_queue_hits(
-            fields[target.field_name], remaining_pairs, clear_absent=True
+    document_id = selected.source_ref.document_id
+    if document_id is None:
+        raise ValueError(
+            "the selected candidate has no source document; a human claim needs one (NFR-01)"
         )
-        snapshot = {name: getattr(component, name) for name in type(component).model_fields}
-        components.append(ComponentInstance.model_validate({**snapshot, "fields": fields}))
-
-    conflicts = tuple(
-        resolved_entry if entry.entry_id == entry_id else entry for entry in result.conflicts
-    )
     human_claim = FieldClaim(
-        document_id=selected.source_ref.document_id or result.sources[0].document_id,
+        document_id=document_id,
         field_name=target.field_name,
         extractor_version=f"{HUMAN_PREFIX}{resolution.resolved_by}",
         condition=selected.condition,
@@ -816,8 +772,43 @@ def review_conflict(
         confidence=1.0,
         resolution=resolution,
     )
+    # The review is re-reduced from claims rather than patched onto the fields
+    # (D-16, C8): the same `reduce_field` that built the queue decides which
+    # fields and entries the decision settles, so a later re-run agrees with it.
+    components: list[ComponentInstance] = []
+    settled: dict[str, Resolution] = {}
+    for component in result.components:
+        if component.supplier != target.supplier or component.model != target.model:
+            components.append(component)
+            continue
+        reduction = reduce_field(
+            [*(c for c in result.claims if c.field_name == target.field_name), human_claim],
+            field_name=target.field_name,
+            supplier=target.supplier,
+            model=target.model,
+            nameplate=component.nameplate,
+            detected_at=target.detected_at,
+            component_category=target.component_category,
+            entry_id_prefix=target.entry_id.split("-", 1)[0] + "-",
+        )
+        settled.update(
+            {entry.entry_id: entry.resolution for entry in reduction.conflicts if entry.resolution}
+        )
+        fields = {name: list(values) for name, values in component.fields.items()}
+        fields[target.field_name] = list(reduction.fields)
+        snapshot = {name: getattr(component, name) for name in type(component).model_fields}
+        components.append(ComponentInstance.model_validate({**snapshot, "fields": fields}))
+    if settled.get(entry_id) != resolution:
+        raise RuntimeError(f"re-reducing after review did not settle {entry_id!r}")
+
+    conflicts = tuple(
+        entry.model_copy(update={"resolution": settled[entry.entry_id]})
+        if entry.resolution is None and entry.entry_id in settled
+        else entry
+        for entry in result.conflicts
+    )
     event = PendingAuditEvent(
-        document_id=selected.source_ref.document_id or result.sources[0].document_id,
+        document_id=document_id,
         event_type="resolution",
         actor=resolution.resolved_by,
         payload=cast(

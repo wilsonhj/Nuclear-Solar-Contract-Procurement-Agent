@@ -376,10 +376,11 @@ def test_document_hash_is_independent_of_row_arrival_order() -> None:
     assert original.audit_events == permuted.audit_events
 
 
-def test_review_resolves_one_pair_without_hiding_a_sibling() -> None:
-    """Non-transitive comparability yields two queue entries for one field.
-    Resolving one pair must succeed and leave the sibling open - fail-closed
-    on hiding, not on progress."""
+def test_review_settles_every_pair_in_its_condition_group() -> None:
+    """Non-transitive comparability yields several queue entries for one field
+    under one condition. D-16: the reviewer's decision is a claim that settles
+    its group, so every entry in that group carries the decision, the field is
+    RESOLVED to the chosen value, and re-reducing the store agrees."""
     third = (
         b"syn-pv-third,file:///sanitized/example-solar-pv650-third.pdf,spec_sheet,"
         b"Example Solar Ltd.,PV-SAN-650,650,nameplate_power,660,Wp,660 Wp,stc,"
@@ -404,17 +405,25 @@ def test_review_resolves_one_pair_without_hiding_a_sibling() -> None:
     )
 
     reviewed = review_conflict(persisted, entry_id=target.entry_id, resolution=resolution)
-    assert reviewed.conflicts[0].resolution is not None or any(
-        entry.entry_id == target.entry_id and entry.resolution is not None
-        for entry in reviewed.conflicts
+
+    field_entries = [e for e in reviewed.conflicts if e.field_name == target.field_name]
+    assert all(entry.resolution == resolution for entry in field_entries)
+    assert reviewed.components[0].unresolved_conflicts() == []
+    [field] = reviewed.components[0].fields["nameplate_power"]
+    assert field.conflict_status is ConflictStatus.RESOLVED
+    assert field.value == target.candidates[1].value
+
+    again = reduce_field(
+        [claim for claim in reviewed.claims if claim.field_name == "nameplate_power"],
+        field_name="nameplate_power",
+        supplier=target.supplier,
+        model=target.model,
+        nameplate=reviewed.components[0].nameplate,
+        detected_at=DETECTED_AT,
     )
-    assert any(
-        entry.entry_id != target.entry_id and entry.resolution is None
-        for entry in reviewed.conflicts
-        if entry.field_name == target.field_name
-    )
-    assert persisted.components[0].unresolved_conflicts() == ["nameplate_power"]
-    assert reviewed.components[0].unresolved_conflicts() == ["nameplate_power"]
+    assert [f.conflict_status for f in again.fields] == [ConflictStatus.RESOLVED]
+    assert {entry.entry_id for entry in again.conflicts} == {e.entry_id for e in field_entries}
+    assert all(entry.resolution == resolution for entry in again.conflicts)
 
 
 def test_workbook_escapes_formula_shaped_supplier_and_model_text(tmp_path: Path) -> None:
@@ -647,7 +656,7 @@ def test_review_conflict_disambiguates_same_number_unit_normalization_with_candi
         _selected_claim_id(
             conflict=reviewed.conflicts[0],
             candidate_claim_ids=candidate_claim_ids,
-            component=reviewed.components[0],
+            claims=reviewed.claims,
         )
         == 101
     )

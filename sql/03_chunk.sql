@@ -211,7 +211,7 @@ CREATE POLICY chunk_app_never_restricted ON public.chunk
 -- Retrieval principal: SELECT only. Incremental add/update/delete of chunks
 -- (FR-RAG-05) is `procurement_ingest`'s job; granting those verbs to the
 -- application role would let it mutate retrieval units it can see and probe
--- ones it cannot except through RLS. The write policies below stay as
+-- ones it cannot except through RLS. The write policies above stay as
 -- defence-in-depth if this GRANT is ever widened.
 GRANT SELECT ON public.chunk TO procurement_app;
 
