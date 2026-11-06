@@ -503,7 +503,7 @@ def test_a_pv_slice_persists_review_and_verified_audit_chains(empty_chain: None)
             """,
             (conflict.entry_id, conflict.entry_id, conflict.entry_id),
         ).fetchone()
-        assert counts == (2, 3, 1, 2, 1, 6)
+        assert counts == (2, 4, 1, 2, 1, 6)
         status = conn.execute(
             "SELECT status FROM public.conflict WHERE entry_id = %s",
             (conflict.entry_id,),
@@ -562,7 +562,11 @@ def test_a_the_cli_exits_zero_on_a_good_chain(empty_chain: None) -> None:
         conn.commit()
 
     assert DSN is not None
-    assert verify_main(["--dsn", DSN]) == 0
+    os.environ["PROCUREMENT_DATABASE_URL"] = DSN
+    try:
+        assert verify_main([]) == 0
+    finally:
+        os.environ.pop("PROCUREMENT_DATABASE_URL", None)
 
 
 def test_a_the_cli_exits_nonzero_on_a_tampered_chain(
@@ -591,5 +595,9 @@ def test_a_the_cli_exits_nonzero_on_a_tampered_chain(
         conn.execute("ALTER TABLE audit.event ENABLE TRIGGER audit_event_no_mutation")
 
     assert DSN is not None
-    assert verify_main(["--dsn", DSN, "--stream", STREAM]) == 1
+    os.environ["PROCUREMENT_DATABASE_URL"] = DSN
+    try:
+        assert verify_main(["--stream", STREAM]) == 1
+    finally:
+        os.environ.pop("PROCUREMENT_DATABASE_URL", None)
     assert "hash_mismatch" in capsys.readouterr().out

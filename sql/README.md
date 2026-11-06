@@ -30,11 +30,12 @@ gets the dependency order right automatically:
 | `02_document.sql` | `document` + RLS | `00`, `01` |
 | `03_chunk.sql` | `chunk` + RLS + tsvector/trgm indexes | `01`, `02` |
 | `04_claim.sql` | `claim` + RLS, plus the shared `public.reject_mutation()` trigger function | `02` |
-| `05_conflict.sql` | `conflict` + RLS, `conflict_candidate` (no RLS — see below), `public.conflict_is_restricted()` | `04` |
+| `05_conflict.sql` | `conflict` + RLS, `conflict_candidate` + FORCE RLS (EXISTS on parent `conflict`; no `conflict_is_restricted` recursion), `public.conflict_is_restricted()` | `04` |
 | `06_resolution.sql` | `resolution` + RLS | `04`, `05` |
 | `07_audit_event.sql` | `audit.event` + RLS, hash-chain columns, both trigger tripwires | `01`, `02` |
 | `08_job.sql` | `job` (stage state machine) + RLS | `02` |
 | `09_claim_natural_key_condition.sql` | fold `condition` into `claim_natural_key` | `04` |
+| `09a_hardening_catch_up.sql` | idempotent catch-up for databases that applied `01`–`09` before their in-place hardening: schema privileges, function `search_path`, `chunk` write revoke, `conflict_candidate` RLS, `recorded_at` default drop, `NULLS NOT DISTINCT` key, confidential-type CHECK. Named `09a` because D-27 assigns `10` | `00`–`09` |
 
 Two shared helpers cross file boundaries: `02_document.sql` defines
 `public.document_is_restricted(text)`, the confidentiality derivation every table
@@ -93,10 +94,12 @@ parse every file. `pglast.get_postgresql_version()` reports `(18, 4)` — the
 exact major version plan.md Decision 3 pins — so this is not a stand-in for a
 similar grammar, it is the real one.
 
-All nine files parse cleanly under this grammar: `00_roles.sql` (6
-statements), `01_extensions_and_settings.sql` (5), `02_document.sql` (11),
-`03_chunk.sql` (18), `04_claim.sql` (10), `05_conflict.sql` (13),
-`06_resolution.sql` (6), `07_audit_event.sql` (15), `08_job.sql` (10). This
+The files `00`–`08` parsed cleanly under this grammar when this was recorded:
+`00_roles.sql` (6 statements), `01_extensions_and_settings.sql` (5),
+`02_document.sql` (11), `03_chunk.sql` (18), `04_claim.sql` (10),
+`05_conflict.sql` (13), `06_resolution.sql` (6), `07_audit_event.sql` (15),
+`08_job.sql` (10). The counts predate the hardening in `09a`'s list and are
+not re-measured here. This
 means every `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE`, `GRANT`, `REVOKE`,
 `CREATE POLICY`, `CREATE TRIGGER`, `CREATE FUNCTION` (outer syntax and
 dollar-quoting), `DO` block, and `ALTER DATABASE`/`ALTER DEFAULT PRIVILEGES`
@@ -380,13 +383,15 @@ follows is what a live run on 16 and 17 still could not reach.
   directory still looked correct. Nothing in DDL can check this; it is a
   deployment property, and it is the single most important thing to get right
   when wiring the application up.
-- **`conflict_candidate` has no RLS**, deliberately. A policy on it calling
-  `conflict_is_restricted` — which reads it — is a genuine infinite recursion,
-  which PostgreSQL rejects at query time rather than at `CREATE POLICY`. The
-  residual exposure is that an unentitled role can see that some conflict has
-  some number of candidate rows; it recovers no value, unit, verbatim text or
-  document id, because `claim` and `conflict` are both gated. Small, real, and
-  recorded rather than closed.
+- **`conflict_candidate` has FORCE RLS**, inheriting parent `conflict`
+  visibility via `EXISTS (SELECT 1 FROM public.conflict c WHERE c.entry_id =
+  ...)`. A policy that called `conflict_is_restricted` — which reads this table
+  — is a genuine infinite recursion, which PostgreSQL rejects at query time
+  rather than at `CREATE POLICY`. Owner/audit roles keep `USING (true)` so the
+  SECURITY DEFINER walk inside `conflict_is_restricted` still sees every
+  candidate under FORCE RLS. `procurement_app` sees candidate rows only for
+  conflicts it can see; the owner roles and `procurement_ingest`, already
+  entitled to restricted content, see all of them.
 
 ## Design decisions made here that the specs did not settle
 
@@ -410,9 +415,10 @@ can check exactly these choices rather than re-deriving the whole schema.
    `(component_category, supplier, model, nameplate)` so the constraint means
    what C8 intends. Two follow-on gaps this introduces, left open rather than
    silently "solved":
-   - `nameplate` NULLs are not collapsed (no `NULLS NOT DISTINCT`), so a
-     category with no bin discriminator and more than one same-supplier-model
-     instance per document is not fully protected against key collision.
+   - `nameplate` NULLs are collapsed (`UNIQUE NULLS NOT DISTINCT`), so a
+     category with no bin discriminator dedupes idempotently under
+     `ON CONFLICT`. The flip side: two genuinely distinct same-supplier-model
+     instances in one document with no nameplate now collide on the key.
    - The key assumes `extractor_version` is fine-grained enough to
      distinguish genuinely different extraction strategies for the same field
      (e.g. WP-B B.6's field-guided vs. document-guided cross-read) so they land
@@ -569,12 +575,20 @@ can check exactly these choices rather than re-deriving the whole schema.
     time — and deriving on read means a reclassification takes effect immediately
     across every dependent table, with no backfill to forget.
 
-    `conflict_candidate` is the one table left out, and for a mechanical reason
-    rather than a judgement — see "What remains unverified".
+    `conflict_candidate` now has FORCE RLS that inherits parent `conflict`
+    visibility via EXISTS, and must not call `conflict_is_restricted` (that
+    function reads this table). Owner/audit roles keep `USING (true)` so the
+    SECURITY DEFINER walk still sees every candidate.
 
-11. **RLS policies are not scoped `TO procurement_app`** — with one deliberate
-    exception, the `procurement_ingest` policies added under decision 22 below,
-    where the scoping *is* the control. With
+11. **RLS policies are not scoped `TO procurement_app`** — with two deliberate
+    exceptions where the scoping *is* the control: the `procurement_ingest`
+    policies added under decision 22 below, and `conflict_candidate`'s. A PUBLIC
+    SELECT policy there would also apply inside `conflict_is_restricted`'s
+    SECURITY DEFINER walk, whose EXISTS on `conflict` re-enters that function
+    and recurses; so its policies are named per role, and a role outside
+    `procurement_owner`, `audit_owner`, `procurement_app` and
+    `procurement_ingest` sees no candidate rows, even with
+    `app.allow_restricted`. With
     `FORCE ROW LEVEL SECURITY`, every non-superuser role — including
     `procurement_owner` if anyone ever `SET ROLE`s into it for maintenance —
     is subject to RLS. A policy scoped only to `procurement_app` would leave

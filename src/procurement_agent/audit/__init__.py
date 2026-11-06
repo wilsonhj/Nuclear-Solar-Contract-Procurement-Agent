@@ -26,11 +26,9 @@ assigns WP-H a separately chained `audit.run_event` table for run-scoped events
 - gap-triggered web searches (A-49) and the `--accept-incomplete` compose-gate
 override - and the taxonomy amendment removing the `web_search` value that
 `audit.event` structurally cannot store. Both need `sql/` changes, and both land
-with WP-H's first emitter. Two further `sql/` changes D-13 requires are also
-outstanding: dropping `recorded_at`'s `DEFAULT clock_timestamp()`, which section
-4 replaces with a caller-supplied value, and updating `sql/README.md` decisions
-5-7. Nothing here depends on the DEFAULT, and `writer` always supplies the
-column.
+with WP-H's first emitter. `recorded_at` no longer has a `DEFAULT
+clock_timestamp()`: section 4's caller-supplied value is required at INSERT.
+Updating `sql/README.md` decisions 5-7 remains outstanding.
 """
 
 from __future__ import annotations

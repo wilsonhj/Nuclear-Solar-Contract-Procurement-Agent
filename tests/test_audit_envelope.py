@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import pathlib
 import re
+import types
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -418,3 +419,18 @@ def test_a_the_verifier_path_reproduces_the_writer_path() -> None:
     """
     event = _golden_event()
     assert digest_of(_preimage_of(event)) == event.hash
+
+
+def test_build_event_accepts_mapping_proxy_payload() -> None:
+    """Read-only MappingProxyType payloads satisfy JsonObject = Mapping[str, JsonValue]
+    and must be accepted at runtime by build_event."""
+    readonly_payload: JsonObject = types.MappingProxyType({"a": 1})
+    event = build_event(
+        document_id=DOCUMENT_ID,
+        event_type="extraction",
+        actor=ACTOR,
+        payload=readonly_payload,
+        recorded_at=RECORDED_AT,
+        tip=None,
+    )
+    assert event.payload_canonical == '{"a":1}'

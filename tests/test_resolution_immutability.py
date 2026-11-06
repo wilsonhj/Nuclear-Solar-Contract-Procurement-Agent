@@ -312,3 +312,53 @@ def test_a_dict_write_can_still_erase_a_decision_and_that_is_recorded() -> None:
     cleared.__dict__["resolution"] = None
     assert cleared.resolution is None
     assert cleared.conflict_status is not ConflictStatus.RESOLVED
+
+
+def test_resolving_an_open_field_normalizes_unresolved_status_and_round_trips() -> None:
+    """D-18: a resolved field has a single representation regardless of whether
+    it was constructed resolved, evolved from OPEN, or mutated via assignment.
+    Leaving `unresolved_status=OPEN` behind on an evolved field broke round-trip
+    equality (`model_validate(model_dump()) != self`) and changed `encode_value`."""
+    from procurement_agent.schema.encoding import encode_value
+
+    open_field = _field(conflict_status=ConflictStatus.OPEN)
+    assert open_field.unresolved_status is UnresolvedStatus.OPEN
+
+    via_evolve_both = open_field.evolve(
+        conflict_status=ConflictStatus.RESOLVED,
+        resolution=_resolution(),
+    )
+    via_evolve_res = open_field.evolve(resolution=_resolution())
+    via_assign = _field(conflict_status=ConflictStatus.OPEN)
+    via_assign.resolution = _resolution()
+    via_assign.conflict_status = ConflictStatus.RESOLVED
+
+    round_tripped = CanonicalField.model_validate(via_evolve_both.model_dump(mode="json"))
+    for candidate in (via_evolve_both, via_evolve_res, via_assign):
+        assert candidate.unresolved_status is UnresolvedStatus.NONE
+        assert candidate == round_tripped
+        assert encode_value(candidate) == encode_value(round_tripped)
+
+
+def test_resolution_rejects_non_finite_values_at_construction() -> None:
+    """`Resolution.value_before` and `value_after` occupy the same polymorphic
+    value slot as `CanonicalField.value` and must reject NaN/Infinity at the
+    boundary rather than crashing `encode_value` at composition time."""
+    with pytest.raises(ValueError, match="non-finite"):
+        Resolution(
+            action=ResolutionAction.SELECT_VALUE,
+            resolved_by="procurement.lead",
+            resolved_at=datetime(2026, 1, 1, tzinfo=UTC),
+            rationale="invalid before",
+            value_before=float("nan"),
+            value_after=650.0,
+        )
+    with pytest.raises(ValueError, match="non-finite"):
+        Resolution(
+            action=ResolutionAction.SELECT_VALUE,
+            resolved_by="procurement.lead",
+            resolved_at=datetime(2026, 1, 1, tzinfo=UTC),
+            rationale="invalid after",
+            value_before=650.0,
+            value_after=float("inf"),
+        )

@@ -1,7 +1,7 @@
 """Canonical data model. TRS sections 5 and 7."""
 
 from .component import ComponentInstance, SourceDocument
-from .encoding import UnencodableValueError, encode_value
+from .encoding import UnencodableValueError, canonical_json, encode_value, is_aware
 from .enums import (
     CATEGORY_TO_TAB,
     CellFlag,
@@ -71,5 +71,7 @@ __all__ = [
     "UnresolvedStatus",
     "VocabularyError",
     "WorkbookTab",
+    "canonical_json",
     "encode_value",
+    "is_aware",
 ]

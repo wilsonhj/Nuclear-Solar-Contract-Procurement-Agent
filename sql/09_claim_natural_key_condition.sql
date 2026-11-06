@@ -16,7 +16,7 @@
 
 ALTER TABLE public.claim DROP CONSTRAINT claim_natural_key;
 
-ALTER TABLE public.claim ADD CONSTRAINT claim_natural_key UNIQUE (
+ALTER TABLE public.claim ADD CONSTRAINT claim_natural_key UNIQUE NULLS NOT DISTINCT (
     document_id, component_category, supplier, model, nameplate, field, extractor_version,
     condition
 );

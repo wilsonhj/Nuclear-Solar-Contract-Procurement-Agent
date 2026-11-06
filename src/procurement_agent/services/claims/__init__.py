@@ -24,32 +24,40 @@ without `condition` defeats the condition gate on the only path that reaches it.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
-import json
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ...schema import (
     CanonicalField,
     ComponentCategory,
     Condition,
     ConflictCandidate,
+    ConflictQueueEntry,
     ConflictStatus,
     Resolution,
     SourceRef,
     SourceTier,
     ToleranceRule,
     UnresolvedStatus,
-    encode_value,
+    canonical_json,
 )
+from ...schema.field import _reject_non_finite_value
 from ...schema.registry import OffContractFieldError, require_contract_key
 from ..conflict_hitl import (
     _as_number,
     _editions_by_base,
+    _normalise_unit,
     assert_no_autonomous_overwrite,
+    assign_severity,
+    comparison_groups,
+    comparison_pairs,
     tolerance_for,
     values_conflict,
 )
@@ -115,6 +123,11 @@ class FieldClaim(BaseModel):
             "is the enforcement."
         ),
     )
+
+    @field_validator("value")
+    @classmethod
+    def _value_must_be_encodable(cls, value: object) -> object:
+        return _reject_non_finite_value(value)
 
     @model_validator(mode="after")
     def _human_claims_carry_their_decision(self) -> FieldClaim:
@@ -333,7 +346,7 @@ def _render(value: object, _containers: tuple[int, ...] = (), *, fold_equal: boo
     return repr(value)
 
 
-def _asserted(claim: FieldClaim) -> tuple[str, str]:
+def _asserted(claim: FieldClaim) -> tuple[str, str | None]:
     """What the claim actually *says*: a value, in a unit.
 
     The unit belongs here because `650 W` and `650 kW` are two different answers.
@@ -358,7 +371,8 @@ def _asserted(claim: FieldClaim) -> tuple[str, str]:
         if tolerance_for(claim.field_name).rule is ToleranceRule.SET_EQUAL
         else _render(claim.value, fold_equal=True)
     )
-    return (rendered, claim.unit or "")
+    unit = _normalise_unit(claim.unit) if claim.unit is not None else None
+    return (rendered, unit)
 
 
 def _set_answer(value: object) -> str:
@@ -401,24 +415,16 @@ def _identity(claim: FieldClaim) -> tuple[str, ...]:
         claim.document_id,
         claim.field_name,
         claim.extractor_version,
-        json.dumps(
-            encode_value(claim.condition.grouping_key()),
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
+        canonical_json(claim.condition.grouping_key()),
         _render(claim.value),
-        claim.unit or "",
-        claim.verbatim_value or "",
+        canonical_json(claim.unit),
+        canonical_json(claim.verbatim_value),
         claim.source_tier.value,
-        repr(claim.source_ref.model_dump(mode="json")),
+        canonical_json(claim.source_ref),
         repr(claim.confidence),
-        ""
-        if claim.resolution is None
-        else json.dumps(
-            encode_value(claim.resolution.model_dump(mode="json")),
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
+        "" if claim.resolution is None else canonical_json(claim.resolution),
+        canonical_json(claim.condition.note),
+        canonical_json(sorted(claim.condition.derived)),
     )
 
 
@@ -435,7 +441,7 @@ def canonical_claims(claims: Iterable[FieldClaim]) -> list[FieldClaim]:
     contradiction.
     """
     ordered = sorted({_identity(c): c for c in claims}.values(), key=_identity)
-    asserted: dict[tuple[object, ...], tuple[str, str]] = {}
+    asserted: dict[tuple[object, ...], tuple[str, str | None]] = {}
     for claim in ordered:
         signature = _asserted(claim)
         previous = asserted.get(claim.claim_key())
@@ -462,10 +468,11 @@ def _status_for(group: Sequence[FieldClaim]) -> ConflictStatus:
     real disagreement in this domain, and dropping the `None` first made it
     invisible.
 
-    Over `_asserted`, the same signature `canonical_claims` uses. Comparing
-    `repr(value)` alone read `650 W` and `650 kW` as one answer and stored the
-    pair as agreement, which is the unit conflict FR-ING-08 says tolerance may
-    never absorb.
+    Over `_asserted` and pairwise `values_conflict` (for comparable rules), so a
+    disagreement the D-2 tolerances or D-5 unit aliases absorb is not flagged.
+    Two cases are OPEN here with no queue entry from `reduce_field`: a
+    missing-vs-present group (a gap, not a value conflict) and a `NEVER_COMPARE`
+    field with differing answers.
     """
     if _human_decision(group) is not None:
         # D-16: a reviewer's decision settles the group. A later extraction that
@@ -474,24 +481,33 @@ def _status_for(group: Sequence[FieldClaim]) -> ConflictStatus:
         # re-running an extractor.
         return ConflictStatus.RESOLVED
     members = list(group)
-    # SET_EQUAL's "missing edition is unknown" is not an equivalence, so a
-    # canonical string cannot be the status. Pairwise `values_conflict` is the
-    # detector, and Open Items must agree with the queue.
-    if tolerance_for(members[0].field_name).rule is ToleranceRule.SET_EQUAL:
-        field_name = members[0].field_name
-        row = tolerance_for(field_name)
-        for index, left in enumerate(members):
-            for right in members[index + 1 :]:
-                if values_conflict(
-                    left.as_candidate(),
-                    right.as_candidate(),
-                    tolerance=row,
-                    field_name=field_name,
-                ).conflicts:
-                    return ConflictStatus.OPEN
+    if len(members) <= 1:
         return ConflictStatus.NONE
+    has_missing = any(claim.value is None for claim in members)
+    has_present = any(claim.value is not None for claim in members)
+    if has_missing and has_present:
+        return ConflictStatus.OPEN
     answers = {_asserted(claim) for claim in members}
-    return ConflictStatus.OPEN if len(answers) > 1 else ConflictStatus.NONE
+    if len(answers) <= 1:
+        return ConflictStatus.NONE
+    if has_missing:
+        return ConflictStatus.OPEN
+    field_name = members[0].field_name
+    row = tolerance_for(field_name)
+    if row.rule is ToleranceRule.NEVER_COMPARE:
+        return ConflictStatus.OPEN
+    for index, left in enumerate(members):
+        for right in members[index + 1 :]:
+            if _asserted(left) == _asserted(right):
+                continue
+            if values_conflict(
+                left.as_candidate(),
+                right.as_candidate(),
+                tolerance=row,
+                field_name=field_name,
+            ).conflicts:
+                return ConflictStatus.OPEN
+    return ConflictStatus.NONE
 
 
 def _human_decision(group: Sequence[FieldClaim]) -> FieldClaim | None:
@@ -577,7 +593,7 @@ def project(claims: Sequence[FieldClaim]) -> list[CanonicalField]:
         groups.setdefault(claim.condition.grouping_key(), []).append(claim)
 
     projected: list[CanonicalField] = []
-    for key in sorted(groups, key=repr):
+    for key in sorted(groups, key=canonical_json):
         group = groups[key]
         chosen = _preferred(group)
         status = _status_for(group)
@@ -599,6 +615,125 @@ def project(claims: Sequence[FieldClaim]) -> list[CanonicalField]:
             )
         )
     return projected
+
+
+def stamp_queue_hits(
+    fields: Sequence[CanonicalField],
+    pairs: Sequence[tuple[ConflictCandidate, ConflictCandidate]],
+) -> list[CanonicalField]:
+    """Copy cross-condition queue hits onto the matching `CanonicalField`s.
+
+    `project()` statuses only inside a `grouping_key()`. `comparison_pairs`
+    still compares unstated vs stated (D-1). Without this copy, the queue sees
+    the disagreement and `flags_for` / C6 / Open Items do not.
+    """
+    involved = {
+        candidate.condition.grouping_key() for left, right in pairs for candidate in (left, right)
+    }
+    stamped: list[CanonicalField] = []
+    for field in fields:
+        key = field.condition.grouping_key()
+        status = field.conflict_status
+        if key in involved and status is ConflictStatus.NONE:
+            stamped.append(field.evolve(conflict_status=ConflictStatus.OPEN))
+        else:
+            stamped.append(field)
+    return stamped
+
+
+@dataclass(frozen=True, slots=True)
+class FieldReduction:
+    """The canonical fields and conflict queue entries reduced from a field's claims."""
+
+    fields: tuple[CanonicalField, ...]
+    conflicts: tuple[ConflictQueueEntry, ...]
+
+
+def reduce_field(
+    claims: Sequence[FieldClaim],
+    *,
+    field_name: str,
+    supplier: str,
+    model: str,
+    nameplate: float | None,
+    detected_at: datetime,
+    component_category: ComponentCategory = ComponentCategory.PV_MODULES,
+    entry_id_prefix: str = "pv-",
+) -> FieldReduction:
+    """Reduce a field's claims into stamped `CanonicalField`s and `ConflictQueueEntry` rows."""
+    ordered = canonical_claims(claims)
+    projected = project(ordered)
+    candidates = [claim.as_candidate() for claim in ordered if not claim.is_human]
+    groups = comparison_groups(candidates)
+    tolerance = tolerance_for(field_name)
+    entries: list[ConflictQueueEntry] = []
+    if tolerance.rule is not ToleranceRule.NEVER_COMPARE:
+        for left, right in comparison_pairs(candidates, field_name=field_name):
+            verdict = values_conflict(
+                left,
+                right,
+                field_name=field_name,
+                tolerance=tolerance,
+            )
+            if not verdict.conflicts:
+                continue
+            assert verdict.conflict_class is not None
+            matching_groups = [group for group in groups if left in group or right in group]
+            condition_group = (
+                [c for group in matching_groups for c in group]
+                if matching_groups
+                else [left, right]
+            )
+            pair = [left, right]
+            entry_material = canonical_json([supplier, model, nameplate, field_name, pair]).encode()
+            entries.append(
+                ConflictQueueEntry(
+                    entry_id=entry_id_prefix + hashlib.sha256(entry_material).hexdigest()[:16],
+                    field_name=field_name,
+                    supplier=supplier,
+                    model=model,
+                    component_category=component_category,
+                    conflict_class=verdict.conflict_class,
+                    severity=assign_severity(
+                        field_name, verdict.conflict_class, condition_group, pair
+                    ),
+                    candidates=pair,
+                    explanation=verdict.reason,
+                    detected_at=detected_at,
+                )
+            )
+    entries = [_settled_by_human(entry, ordered) for entry in entries]
+    open_pairs = [
+        (entry.candidates[0], entry.candidates[1])
+        for entry in entries
+        if entry.resolution is None and len(entry.candidates) >= 2
+    ]
+    stamped = stamp_queue_hits(projected, open_pairs)
+    return FieldReduction(fields=tuple(stamped), conflicts=tuple(entries))
+
+
+def _settled_by_human(
+    entry: ConflictQueueEntry, claims: Sequence[FieldClaim]
+) -> ConflictQueueEntry:
+    """Attach the decision that settles this entry's group, if a reviewer made one.
+
+    D-16: a human claim settles its condition group, and a settled group stays
+    settled. So an entry with a candidate in that group carries the decision -
+    the latest `resolved_at` when there are several - and re-reducing the store
+    after a review never reports the reviewed pair as pending again.
+    """
+    keys = {candidate.condition.grouping_key() for candidate in entry.candidates}
+    decisions = [
+        claim.resolution
+        for claim in claims
+        if claim.is_human
+        and claim.resolution is not None
+        and claim.condition.grouping_key() in keys
+    ]
+    if not decisions or entry.resolution is not None:
+        return entry
+    latest = max(decisions, key=lambda resolution: resolution.resolved_at)
+    return entry.model_copy(update={"resolution": latest})
 
 
 def commit_claims(
@@ -665,7 +800,7 @@ def commit_claims(
         return []
     existing = {field.condition.grouping_key(): field for field in writer.current(field_name)}
     covered = {field.condition.grouping_key() for field in projected}
-    dropped = sorted((key for key in existing if key not in covered), key=repr)
+    dropped = sorted((key for key in existing if key not in covered), key=canonical_json)
     if dropped:
         raise StoredValueLossError(
             f"committing this projection would drop {len(dropped)} stored condition "

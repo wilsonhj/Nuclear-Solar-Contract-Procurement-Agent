@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any, Literal, Self
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -67,6 +68,21 @@ class Settings(BaseSettings):
     llm_api_key: SecretStr | None = None
     embedding_endpoint: str | None = None
     embedding_model: str | None = None
+
+    @field_validator("llm_endpoint", "embedding_endpoint")
+    @classmethod
+    def _reject_endpoint_userinfo(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("endpoint URL must be an absolute http(s) URL with a host")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError(
+                "endpoint URL must not contain embedded userinfo credentials; "
+                "pass credentials through a SecretStr *_api_key setting instead"
+            )
+        return value
 
     database_url: SecretStr | None = None
     vector_store_url: SecretStr | None = None

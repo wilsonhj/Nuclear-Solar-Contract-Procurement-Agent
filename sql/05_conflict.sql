@@ -114,6 +114,43 @@ ALTER TABLE public.conflict_candidate OWNER TO procurement_owner;
 GRANT SELECT, INSERT ON public.conflict_candidate TO procurement_app;
 GRANT SELECT, INSERT ON public.conflict_candidate TO procurement_ingest;
 
+ALTER TABLE public.conflict_candidate ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.conflict_candidate FORCE ROW LEVEL SECURITY;
+
+-- Visibility inherits the parent `conflict` row via EXISTS, not via
+-- `conflict_is_restricted()`. That function reads this table: a policy here
+-- that called it would recurse, which PostgreSQL rejects at query time.
+--
+-- `procurement_owner` / `audit_owner` get USING (true) so the SECURITY DEFINER
+-- walk inside `conflict_is_restricted` still sees every candidate row under
+-- FORCE RLS. Without that owner policy no policy applies to the owner, FORCE
+-- RLS default-denies, the walk sees no candidates, and every conflict reads as
+-- unrestricted - failing open. The EXISTS policy below cannot stand in: it is
+-- scoped to procurement_app, and a PUBLIC version would apply inside the walk
+-- and re-enter `conflict_is_restricted`.
+CREATE POLICY conflict_candidate_owner ON public.conflict_candidate
+    FOR ALL TO procurement_owner, audit_owner
+    USING (true)
+    WITH CHECK (true);
+
+CREATE POLICY conflict_candidate_select ON public.conflict_candidate
+    FOR SELECT TO procurement_app
+    USING (
+        EXISTS (
+            SELECT 1
+            FROM public.conflict c
+            WHERE c.entry_id = public.conflict_candidate.entry_id
+        )
+    );
+
+CREATE POLICY conflict_candidate_insert ON public.conflict_candidate
+    FOR INSERT TO procurement_app, procurement_ingest
+    WITH CHECK (true);
+
+CREATE POLICY conflict_candidate_ingest_select ON public.conflict_candidate
+    FOR SELECT TO procurement_ingest
+    USING (true);
+
 -- ---------------------------------------------------------------------------
 -- Confidentiality for the queue (NFR-03, AC-8).
 --
@@ -141,13 +178,11 @@ GRANT SELECT, INSERT ON public.conflict_candidate TO procurement_ingest;
 -- and a lookup that cannot see restricted claims would report every conflict as
 -- unrestricted -- failing open, in the one function whose job is to fail closed.
 --
--- Deliberately NOT applied to `conflict_candidate` itself: that table holds only
--- (entry_id, claim_id, ordinal), no content, and a policy on it calling this
--- function -- which reads it -- is a genuine infinite recursion, which
--- PostgreSQL rejects at query time rather than at CREATE POLICY. The residual
--- exposure is that an unentitled role can see that some conflict has some number
--- of candidates; it recovers no value, unit, verbatim text or document id,
--- because claim and conflict are both gated. Recorded in sql/README.md.
+-- `conflict_candidate` now has FORCE RLS. Its SELECT policy inherits parent
+-- `conflict` visibility via EXISTS, and must not call this function -- which
+-- reads `conflict_candidate` -- or PostgreSQL rejects the query as recursive.
+-- Owner/audit roles keep USING (true) so this SECURITY DEFINER walk still
+-- sees every candidate under FORCE RLS. See the policies above.
 CREATE FUNCTION public.conflict_is_restricted(p_entry_id text)
     RETURNS boolean
     LANGUAGE sql
@@ -161,7 +196,7 @@ CREATE FUNCTION public.conflict_is_restricted(p_entry_id text)
           AND public.document_is_restricted(c.document_id)
     );
 $$ SECURITY DEFINER
-   SET search_path = public, pg_temp
+   SET search_path = pg_catalog, pg_temp
    SET app.allow_restricted = 'true';
 
 ALTER FUNCTION public.conflict_is_restricted(text) OWNER TO procurement_owner;

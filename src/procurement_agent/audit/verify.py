@@ -60,6 +60,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -471,9 +473,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--dsn",
-        required=True,
-        help="PostgreSQL connection string. Use an identity entitled to read restricted "
-        "documents: a walk that silently skipped rows would report broken links.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--stream",
@@ -483,6 +484,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Verify only this stream. Repeatable. Defaults to every stream present.",
     )
     args = parser.parse_args(argv)
+    if args.dsn is not None:
+        print(
+            "error: --dsn is refused because a connection string on the command line "
+            "is visible in the process list. Set PROCUREMENT_DATABASE_URL instead.",
+            file=sys.stderr,
+        )
+        return 2
+    dsn = os.environ.get("PROCUREMENT_DATABASE_URL")
+    if not dsn:
+        print(
+            "error: a database connection string is required via PROCUREMENT_DATABASE_URL.",
+            file=sys.stderr,
+        )
+        return 2
 
     # A stream that cannot exist would otherwise return zero rows and report OK,
     # which is the one output an operator must never get from a typo. Checked
@@ -503,10 +518,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     failed = 0
-    with psycopg.connect(args.dsn, autocommit=True) as conn:
+    with psycopg.connect(dsn, autocommit=True) as conn:
         # sql/07: the verifier runs as an operator identity that sets this,
         # "exactly as the confidentiality model intends".
         conn.execute("SET app.allow_restricted = 'true'")
+        # The GUC cannot lift `audit_event_app_never_restricted`, so a run as the
+        # serving identity would skip every restricted stream and still print OK.
+        # Refuse it rather than verify a subset and call it everything.
+        hidden = conn.execute(
+            """
+            SELECT NOT r.rolsuper
+                   AND pg_catalog.pg_has_role(current_user, 'procurement_app', 'MEMBER')
+              FROM pg_catalog.pg_roles r
+             WHERE r.rolname = current_user
+               AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'procurement_app')
+            """
+        ).fetchone()
+        if hidden is not None and hidden[0]:
+            print(
+                "error: the verifier is connected as procurement_app, which cannot see "
+                "restricted streams; connect as an operator identity entitled to them."
+            )
+            return 2
         requested = list(args.streams or ())
         streams = requested or read_streams(conn)
 

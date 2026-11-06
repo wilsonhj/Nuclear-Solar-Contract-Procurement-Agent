@@ -36,7 +36,7 @@ SENTINEL = "PLAINTEXT-THAT-MUST-NEVER-RENDER-8f3a1c"
 #: and a DSN whose userinfo carries a password. Deliberately does not match
 #: `llm_endpoint` or `embedding_model`, which name a service rather than
 #: authorise anything.
-_CREDENTIAL_PATTERN = re.compile(r"(_api_key|_url)$")
+_CREDENTIAL_PATTERN = re.compile(r"(_api_key|_url|_secret|_token|_password|_dsn)$")
 
 _CREDENTIAL_FIELDS = sorted(
     name for name in Settings.model_fields if _CREDENTIAL_PATTERN.search(name)
@@ -193,3 +193,14 @@ def test_a_non_credential_setting_is_left_readable() -> None:
     """
     settings = _isolated(llm_endpoint="https://vllm.internal:8000/v1")
     assert "vllm.internal" in repr(settings)
+
+
+def test_endpoint_settings_refuse_embedded_userinfo_credentials() -> None:
+    """SEC-MEDIUM-2: `llm_endpoint` and `embedding_endpoint` are plain `str`
+    fields because 'a URL with no userinfo authorises nobody'. Supplying
+    `https://user:password@host/v1` in an endpoint URL must be rejected at
+    construction and assignment so credentials cannot bypass `SecretStr`."""
+    with pytest.raises(ValueError, match="userinfo"):
+        _isolated(llm_endpoint="https://admin:secret@vllm.internal:8000/v1")
+    with pytest.raises(ValueError, match="userinfo"):
+        _isolated(embedding_endpoint="https://token@embed.internal:8000/v1")

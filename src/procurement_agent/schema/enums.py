@@ -52,6 +52,19 @@ class DocumentType(StrEnum):
     SPEC_SHEET = "spec_sheet"
 
 
+#: Document types that contain confidential commercial or contractual terms by
+#: definition (NFR-03, C-6, D-15).
+RESTRICTED_DOCUMENT_TYPES: frozenset[DocumentType] = frozenset(
+    {
+        DocumentType.CONTRACT_TOS,
+        DocumentType.PURCHASE_ORDER,
+        DocumentType.PRICING,
+        DocumentType.TERMS_AND_CONDITIONS,
+        DocumentType.WARRANTY,
+    }
+)
+
+
 class ConflictClass(StrEnum):
     """The five conflict classes detected at field level (FR-HITL-01)."""
 

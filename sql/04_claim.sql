@@ -80,11 +80,10 @@ CREATE TABLE public.claim (
     -- rather than what it literally says -- flagged in sql/README.md as an
     -- interpretation, not a literal reading, of a frozen contract.
     --
-    -- NULLs in `nameplate` are NOT collapsed (no NULLS NOT DISTINCT): a
-    -- category without a bin discriminator would otherwise need every claim
-    -- for one supplier+model in one document to be the sole instance, which is
-    -- not guaranteed. This is a known, narrow gap, not a solved one -- see
-    -- sql/README.md.
+    -- NULLs in `nameplate` are collapsed via `NULLS NOT DISTINCT` so that
+    -- retrying extraction for a component category without a bin discriminator
+    -- (where `nameplate IS NULL`) deduplicates idempotently under `ON CONFLICT`
+    -- rather than inserting duplicate rows on every retry.
     --
     -- `condition` is in the key because Python `FieldClaim.claim_key()` includes
     -- `grouping_key()`. Without it, one document / one field / one extractor
@@ -96,7 +95,7 @@ CREATE TABLE public.claim (
     -- field (e.g. WP-B B.6's field-guided vs document-guided cross-read), so
     -- that the two produce distinct claim rows rather than colliding under
     -- this key -- also flagged in sql/README.md.
-    CONSTRAINT claim_natural_key UNIQUE (
+    CONSTRAINT claim_natural_key UNIQUE NULLS NOT DISTINCT (
         document_id, component_category, supplier, model, nameplate, field, extractor_version,
         condition
     )
@@ -219,6 +218,7 @@ GRANT SELECT, INSERT ON public.claim TO procurement_ingest;
 -- audit/core privilege boundary either.
 CREATE FUNCTION public.reject_mutation() RETURNS trigger
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp
     AS $$
 BEGIN
     RAISE EXCEPTION
@@ -253,6 +253,7 @@ CREATE TRIGGER claim_no_mutation
 -- `TRUNCATE | Trigger: blocked`, which is what this restores.
 CREATE FUNCTION public.reject_truncate() RETURNS trigger
     LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp
     AS $$
 BEGIN
     RAISE EXCEPTION

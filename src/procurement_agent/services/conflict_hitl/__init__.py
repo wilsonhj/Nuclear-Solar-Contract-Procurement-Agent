@@ -13,7 +13,6 @@ AC-2 tests it directly.
 from __future__ import annotations
 
 import itertools
-import json
 import math
 import re
 import unicodedata
@@ -33,8 +32,9 @@ from ...schema import (
     StandardsRegime,
     ToleranceCondition,
     ToleranceRule,
-    encode_value,
+    canonical_json,
 )
+from ...schema.field import UNIT_ALIASES, normalise_unit
 from ...schema.registry import condition_dimensions_for
 from .severity import assign_severity as assign_severity  # re-exported: the D-3 lookup
 from .tolerance import FieldTolerance
@@ -85,7 +85,7 @@ def _canonical(value: object) -> str:
     encodable for the C6 projection anyway, so failing at the sort surfaces it at
     the earliest point rather than at artifact time.
     """
-    return json.dumps(encode_value(value), sort_keys=True, separators=(",", ":"))
+    return canonical_json(value)
 
 
 def _ordering_key(candidate: ConflictCandidate) -> tuple[str, ...]:
@@ -356,8 +356,8 @@ def _normalise_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
-#: Unit spellings the frozen contract declares to be **one unit**, folded to a
-#: single form. Not a unit-conversion table, and deliberately not the start of one.
+#: Why `schema.field.UNIT_ALIASES` folds the spellings it does: the frozen contract
+#: declares them **one unit**. Not a unit-conversion table, and deliberately not the start of one.
 #:
 #: A temperature *coefficient* is per-degree-*interval*, and one degree Celsius is
 #: one kelvin as an interval, so `%/degC`, `%/K` and `%/°C` name the same quantity
@@ -378,27 +378,8 @@ def _normalise_text(value: str) -> str:
 #: The degree-sign row carries the sign because a datasheet prints it; U+2103 is
 #: absent because NFKC already folds it to `°C`, and listing it would suggest the
 #: table is doing work `_normalise_text` has already done.
-_UNIT_ALIASES: dict[str, str] = {
-    "%/k": "%/degc",
-    "%/°c": "%/degc",
-}
-
-_SLASH_SPACING = re.compile(r"\s*/\s*")
-
-
-def _normalise_unit(value: str) -> str:
-    """A unit folded to its comparable form.
-
-    `_normalise_text` plus the alias table above, and nothing else. In particular
-    the slash-spacing collapse is applied *only* to build the lookup key: a
-    spelling that is not an alias comes back exactly as `_normalise_text` left it,
-    so `USD / W` against `USD/kW` is still the unit conflict it was. Widening this
-    into "units that look alike are alike" is the direction D-2 forbids - a unit
-    mismatch is never resolved by tolerance, because normalising here would hide
-    an extraction defect behind a successful comparison.
-    """
-    text = _normalise_text(value)
-    return _UNIT_ALIASES.get(_SLASH_SPACING.sub("/", text), text)
+_UNIT_ALIASES = UNIT_ALIASES
+_normalise_unit = normalise_unit
 
 
 def _split_edition(value: str) -> tuple[str, str | None]:
@@ -579,7 +560,10 @@ def values_conflict(
     purpose - a single float was the defect D-2 exists to remove, and leaving one
     in the signature would let it come back as a call-site default.
 
-    `band_a`/`band_b` carry the *declared* bands for a DECLARED_BAND field. They
+    `band_a`/`band_b` carry *declared* bands. When either is supplied it governs
+    the comparison whatever the field's tolerance rule (a printed band supersedes
+    the configured one); a DECLARED_BAND field with neither falls back to
+    printed precision. They
     are parameters rather than attributes of the candidate because the band lives
     on a different canonical field (`power_tolerance`) than the value it
     qualifies (`nameplate_power_w`); only a caller holding the whole component
@@ -685,13 +669,19 @@ def values_conflict(
             return ConflictVerdict(
                 conflicts=True,
                 conflict_class=_classify(a, b),
-                reason=f"lists differ as written ({a.value!r} vs {b.value!r}); this field has "
-                "no SET_EQUAL tolerance row, so element order counts",
+                reason=(
+                    f"lists differ as written ({_canonical(a.value)} vs "
+                    f"{_canonical(b.value)}); this field has "
+                    "no SET_EQUAL tolerance row, so element order counts"
+                ),
             )
         return ConflictVerdict(
             conflicts=True,
             conflict_class=_classify(a, b),
-            reason=f"values are not comparable as numbers or text ({a.value!r} vs {b.value!r})",
+            reason=(
+                "values are not comparable as numbers or text "
+                f"({_canonical(a.value)} vs {_canonical(b.value)})"
+            ),
         )
 
     return _compare_numbers(a, b, number_a, number_b, tolerance, band_a, band_b)
@@ -712,9 +702,13 @@ def _compare_sets(a: ConflictCandidate, b: ConflictCandidate) -> ConflictVerdict
         return ConflictVerdict(
             conflicts=True,
             conflict_class=_classify(a, b),
-            reason=f"a SET_EQUAL field holds a non-list value ({a.value!r} vs {b.value!r}); "
-            "an extractor emitted a scalar where the contract types a list",
+            reason=(
+                f"a SET_EQUAL field holds a non-list value ({_canonical(a.value)} vs "
+                f"{_canonical(b.value)}); "
+                "an extractor emitted a scalar where the contract types a list"
+            ),
         )
+
     left, right = _editions_by_base(a.value), _editions_by_base(b.value)
     only_left = sorted(left.keys() - right.keys())
     only_right = sorted(right.keys() - left.keys())
@@ -773,7 +767,7 @@ def _compare_numbers(
     conflict_class = _classify(a, b)
     floor = _rounding_floor(a, b)
 
-    if tolerance.rule is ToleranceRule.DECLARED_BAND:
+    if tolerance.rule is ToleranceRule.DECLARED_BAND or band_a is not None or band_b is not None:
         if band_a is None and band_b is None:
             return ConflictVerdict(
                 conflicts=abs(number_a - number_b) > floor,

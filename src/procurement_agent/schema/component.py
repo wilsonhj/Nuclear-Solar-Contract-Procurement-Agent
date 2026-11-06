@@ -8,14 +8,15 @@ Stage 1 exit condition, so they belong in a follow-up rather than in scaffolding
 
 from __future__ import annotations
 
-import json
 import math
+from collections.abc import Mapping
 from datetime import datetime
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .encoding import encode_value
-from .enums import ComponentCategory, ConflictStatus, DocumentType
+from .encoding import canonical_json, is_aware
+from .enums import RESTRICTED_DOCUMENT_TYPES, ComponentCategory, ConflictStatus, DocumentType
 from .field import CanonicalField
 from .registry import require_contract_key
 
@@ -64,12 +65,37 @@ class SourceDocument(BaseModel):
         why this would otherwise have been found by whoever wrote the first
         ingestion boundary, after the naive timestamps were already stored.
         """
-        if value is not None and (value.tzinfo is None or value.tzinfo.utcoffset(value) is None):
+        if value is not None and not is_aware(value):
             raise ValueError(
                 "SourceDocument timestamps must be timezone-aware; a naive datetime "
                 "names no instant. Attach the zone at the boundary that produced it."
             )
         return value
+
+    @model_validator(mode="after")
+    def _enforce_confidential_document_restriction(self) -> SourceDocument:
+        """NFR-03 / D-15: confidential document types ratchet `access_restricted=True`."""
+        if self.document_type in RESTRICTED_DOCUMENT_TYPES and not self.access_restricted:
+            object.__setattr__(self, "access_restricted", True)
+        return self
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Re-validate a copy that changes fields, so the ratchet above still holds.
+
+        Stock `model_copy(update=...)` writes `__dict__` with no validator, which
+        would let a pricing document be copied out as `access_restricted=False`.
+        """
+        if update is None:
+            return super().model_copy(deep=deep)
+        return type(self).model_validate({**super().model_copy(deep=deep).__dict__, **update})
+
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:
+        """Build without validation, but never as an unrestricted confidential type."""
+        built = super().model_construct(_fields_set, **values)
+        if built.document_type in RESTRICTED_DOCUMENT_TYPES and not built.access_restricted:
+            object.__setattr__(built, "access_restricted", True)
+        return built
 
 
 class ComponentInstance(BaseModel):
@@ -225,12 +251,7 @@ class ComponentInstance(BaseModel):
         undo the entity split silently - the obvious way to make a key unique is
         the one that breaks the thing the key was normalised for.
         """
-        return json.dumps(
-            encode_value(self.fields),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
+        return canonical_json(self.fields)
 
     def ordering_key(self) -> tuple[str, str, str, float, str, str, str]:
         """Canonical sort position for deterministic workbook regeneration.
@@ -337,18 +358,14 @@ class ComponentInstance(BaseModel):
         value. At that point the rows differ in the output, so leaving them
         unordered is the defect and ordering them cannot merge anything.
         """
-        return json.dumps(
-            encode_value(
-                [
-                    self.supplier,
-                    self.model,
-                    self.manufacturer_key,
-                    self.model_family,
-                    self.surrogate_id,
-                ]
-            ),
-            separators=(",", ":"),
-            ensure_ascii=False,
+        return canonical_json(
+            [
+                self.supplier,
+                self.model,
+                self.manufacturer_key,
+                self.model_family,
+                self.surrogate_id,
+            ]
         )
 
     def unresolved_conflicts(self) -> list[str]:

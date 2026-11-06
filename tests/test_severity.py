@@ -894,3 +894,19 @@ def test_result_does_not_depend_on_candidate_order() -> None:
     forward = assign_severity("nameplate_power", ConflictClass.INTER_DOCUMENT, [a, b], [a, b])
     backward = assign_severity("nameplate_power", ConflictClass.INTER_DOCUMENT, [b, a], [b, a])
     assert forward == backward
+
+
+def test_unit_reconciliation_normalizes_slash_spacing_and_nfkc() -> None:
+    """`conflict_hitl._normalise_unit` and `schema/field.py:_comparable_unit`
+    fold slash spacing (`'USD / W'` -> `'usd/w'`) and NFKC compatibility chars.
+    `severity.py` must normalize units the same way before looking up
+    `_BASE_UNIT`, otherwise `'USD / W'` vs `'USD/kW'` on an identical price misses
+    the unit-reconciliation discount and triggers a false +1 gross-divergence
+    penalty."""
+    from procurement_agent.services.conflict_hitl import tolerance_for
+
+    a = _c(0.35, unit="USD / W", doc="doc-a")
+    b = _c(350.0, unit="USD/kW", doc="doc-b")
+    pair = [a, b]
+    assert severity_module._reconciles(a, b, tolerance_for("price_per_watt_dc"))
+    assert severity_module._scaled_numbers(pair) == pytest.approx([0.35, 0.35])

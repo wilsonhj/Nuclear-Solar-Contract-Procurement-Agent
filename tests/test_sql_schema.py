@@ -80,6 +80,7 @@ def test_the_expected_files_are_all_present() -> None:
         "07_audit_event.sql",
         "08_job.sql",
         "09_claim_natural_key_condition.sql",
+        "09a_hardening_catch_up.sql",
     ]
 
 
@@ -89,11 +90,12 @@ def test_claim_natural_key_includes_condition() -> None:
     `_existing_claim_id` and cannot persist D-1.
 
     Asserted on the create-time constraint *and* the forward migration, because
-    a live database that already applied `04` will not re-run it.
+    a live database that already applied `04` will not re-run it. `NULLS NOT
+    DISTINCT` ensures nullable `nameplate` values still deduplicate on retry.
     """
     create = _sql("04_claim.sql")
     match = re.search(
-        r"CONSTRAINT claim_natural_key UNIQUE\s*\((.*?)\)",
+        r"CONSTRAINT claim_natural_key UNIQUE NULLS NOT DISTINCT\s*\((.*?)\)",
         create,
         re.DOTALL,
     )
@@ -101,6 +103,7 @@ def test_claim_natural_key_includes_condition() -> None:
     columns = [part.strip() for part in match.group(1).split(",")]
     assert "condition" in columns
     migration = _sql("09_claim_natural_key_condition.sql")
+    assert "UNIQUE NULLS NOT DISTINCT" in migration
     assert "claim_natural_key" in migration
     assert re.search(r"\bcondition\b", migration) is not None
 
@@ -391,6 +394,45 @@ def test_the_derivation_helpers_are_security_definer_and_pinned() -> None:
         assert f"REVOKE EXECUTE ON FUNCTION {function}" in text
 
 
+def test_every_function_pins_search_path() -> None:
+    """Every `CREATE FUNCTION` across `sql/*.sql` must pin an explicit
+    `SET search_path` (not just `SECURITY DEFINER` helpers) so trigger functions
+    cannot resolve unqualified objects through a caller-controlled search_path."""
+    function_pattern = re.compile(
+        r"CREATE FUNCTION\s+([\w.]+)\s*\(.*?\$\$.*?\$\$[^;]*;",
+        re.DOTALL,
+    )
+    found: list[str] = []
+    for filename in ALL_FILES:
+        without_comments = re.sub(r"--[^\n]*", "", _sql(filename))
+        raw_count = len(re.findall(r"\bCREATE FUNCTION\b", without_comments))
+        matches = list(function_pattern.finditer(without_comments))
+        assert len(matches) == raw_count, f"{filename}: failed to parse all CREATE FUNCTION blocks"
+        for match in matches:
+            func_name = match.group(1)
+            block = match.group(0)
+            found.append(func_name)
+            assert re.search(r"\bSET\s+search_path\s*=", block), (
+                f"{filename}: {func_name} does not pin SET search_path"
+            )
+    assert len(found) >= 8
+
+
+def test_public_schema_revokes_create_from_public() -> None:
+    """`01_extensions_and_settings.sql` explicitly revokes `CREATE ON SCHEMA public
+    FROM PUBLIC` (defense-in-depth alongside PostgreSQL 15+ defaults) and grants
+    explicit `USAGE` to the managed roles."""
+    statements = _statements(_sql("01_extensions_and_settings.sql"))
+    assert any(
+        re.match(r"^REVOKE\s+CREATE\s+ON\s+SCHEMA\s+public\s+FROM\s+PUBLIC$", s, re.IGNORECASE)
+        for s in statements
+    ), "01_extensions_and_settings.sql does not revoke CREATE ON SCHEMA public FROM PUBLIC"
+    assert any(
+        re.match(r"^GRANT\s+USAGE\s+ON\s+SCHEMA\s+public\s+TO\b", s, re.IGNORECASE)
+        for s in statements
+    ), "01_extensions_and_settings.sql does not explicitly grant USAGE ON SCHEMA public"
+
+
 # --- the RLS/trigger interaction the append-only tables depend on --------------
 
 _APPEND_ONLY = [
@@ -516,3 +558,46 @@ def test_the_job_identity_columns_are_never_updatable() -> None:
         "updated_at",
     ):
         assert column not in allowed
+
+
+def test_recorded_at_has_no_clock_default() -> None:
+    """D-13 section 4 hashes recorded_at. A DEFAULT clock_timestamp() lets a
+    forgotten INSERT succeed with a timestamp the caller never hashed."""
+    without_comments = re.sub(r"--[^\n]*", "", _sql("07_audit_event.sql"))
+    column = re.search(
+        r"recorded_at\s+timestamptz\s+NOT NULL(?:\s+DEFAULT\s+[^,\n]+)?",
+        without_comments,
+    )
+    assert column is not None
+    assert "DEFAULT" not in column.group(0)
+    assert "clock_timestamp()" not in without_comments
+
+
+def test_app_role_chunk_grant_is_select_only() -> None:
+    """SEC-HIGH-2: procurement_app reads chunks; procurement_ingest mutates them."""
+    grants = [
+        s
+        for s in _statements(_sql("03_chunk.sql"))
+        if s.upper().startswith("GRANT") and "ON public.chunk" in s and "procurement_app" in s
+    ]
+    assert grants == ["GRANT SELECT ON public.chunk TO procurement_app"]
+
+
+def test_conflict_candidate_forces_rls_via_parent_conflict() -> None:
+    """SEC-HIGH-3: junction visibility inherits `conflict` without calling
+    `conflict_is_restricted` on this table (that path recurses)."""
+    text = _sql("05_conflict.sql")
+    assert "ALTER TABLE public.conflict_candidate ENABLE ROW LEVEL SECURITY" in text
+    assert "ALTER TABLE public.conflict_candidate FORCE ROW LEVEL SECURITY" in text
+    policies = [
+        s
+        for s in _statements(text)
+        if s.upper().startswith("CREATE POLICY") and "ON public.conflict_candidate" in s
+    ]
+    assert policies
+    combined = " ".join(policies)
+    assert "conflict_is_restricted" not in combined
+    assert re.search(r"EXISTS\s*\(\s*SELECT 1\s+FROM public\.conflict", combined)
+    assert "TO procurement_owner, audit_owner" in combined or (
+        "TO procurement_owner" in combined and "TO audit_owner" in combined
+    )

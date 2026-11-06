@@ -24,6 +24,11 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- `audit` in a future migration.
 CREATE SCHEMA IF NOT EXISTS audit AUTHORIZATION audit_owner;
 
+-- Lock down `public` schema creation explicitly (defense-in-depth alongside
+-- PostgreSQL 15+ defaults) and grant explicit schema usage to managed roles.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO procurement_owner, audit_owner, procurement_app, procurement_ingest;
+
 COMMENT ON SCHEMA audit IS
     'Append-only audit trail (contract C4). Owned by audit_owner (NOLOGIN); the '
     'application role holds INSERT, SELECT only on audit.event -- see '

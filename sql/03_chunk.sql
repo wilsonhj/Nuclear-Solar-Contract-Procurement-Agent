@@ -208,7 +208,12 @@ CREATE POLICY chunk_app_never_restricted ON public.chunk
     USING (NOT access_restricted)
     WITH CHECK (true);
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.chunk TO procurement_app;
+-- Retrieval principal: SELECT only. Incremental add/update/delete of chunks
+-- (FR-RAG-05) is `procurement_ingest`'s job; granting those verbs to the
+-- application role would let it mutate retrieval units it can see and probe
+-- ones it cannot except through RLS. The write policies above stay as
+-- defence-in-depth if this GRANT is ever widened.
+GRANT SELECT ON public.chunk TO procurement_app;
 
 -- The indexing principal (00_roles.sql, procurement_ingest); see the long
 -- comment on the equivalent policies in 02_document.sql for why this role
@@ -303,7 +308,7 @@ BEGIN
     RETURN NEW;
 END;
 $$ SECURITY DEFINER
-   SET search_path = public, pg_temp
+   SET search_path = pg_catalog, pg_temp
    SET app.allow_restricted = 'true';
 
 -- SECURITY DEFINER is deliberate and is the one such function in this schema.
