@@ -20,6 +20,10 @@ _Avoid_: citation, footnote, link
 A confidentiality marker on a **Source Document** (and inherited by all derived records) indicating that the content contains commercially sensitive terms (such as pricing, purchase orders, or contracts) visible only to cleared principals.
 _Avoid_: permission flag, private mode
 
+**Parsed Element**:
+The unit a parser or OCR adapter returns (`ports.ParsedElement`): a kind from the closed set `heading`, `body`, `table`, `figure`, its text, and where it sits. Extended only additively (D-23), plus the heading-path section D-19 requires (ADR-002 decision 7).
+_Avoid_: block, chunk (a chunk is a retrieval unit)
+
 ## Claims & Canonical State
 
 **Component Instance**:
@@ -46,6 +50,14 @@ _Avoid_: final value, merged attribute
 The deterministic projection of an append-only set of **Field Claims** into **Canonical Fields** and **Conflict Queue Entries**, enforcing that **Web Supplement** claims never autonomously overwrite **System of Record** claims.
 _Avoid_: deduplication, merging, arbitration
 
+**Human Claim**:
+A **Field Claim** whose extractor version starts with `human:` and which carries the reviewer's **Resolution**. The only way a human decision enters the store (D-16); its row links to that resolution by `claim.resolution_id` (D-27).
+_Avoid_: manual edit, override row
+
+**Identity Keys**:
+The normalised supplier, model family and nameplate that say which **Component Instance** a claim is about (D-4). The surrogate ID is their hash, built by one factory and never assembled by a caller (ADR-002 decision 5).
+_Avoid_: grouping key
+
 ## Disagreement & Human Review
 
 **Tolerance Policy**:
@@ -68,6 +80,14 @@ _Avoid_: risk score, confidence weight
 An immutable, attributed human decision (`SELECT_VALUE`, `KEEP_SYSTEM_OF_RECORD`, `ENTER_OVERRIDE`, `REQUEST_MORE_WEB_SEARCH`, or `DEFER`) with rationale and before/after values that settles or re-queues a **Conflict Queue Entry**.
 _Avoid_: edit, hotfix, cell override
 
+**Conflict Status**:
+`none`, `open`, `insufficient_evidence` or `resolved` on a **Canonical Field**. `resolved` is derived from a settling **Human Claim**, never stored by hand (D-18). Every `open` field has a **Conflict Queue Entry**, and low-confidence and insufficient-evidence fields route to the same queue (FR-HITL-05).
+_Avoid_: state flag
+
+**Settling Action**:
+`SELECT_VALUE`, `ENTER_OVERRIDE` or `KEEP_SYSTEM_OF_RECORD`: a **Resolution** that settles its entry. At most one per **Conflict Queue Entry**; `DEFER` and `REQUEST_MORE_WEB_SEARCH` are recorded but settle nothing (ADR-002 decision 2).
+_Avoid_: final answer
+
 ## Composition & Audit
 
 **Compose Gate**:
@@ -81,3 +101,17 @@ _Avoid_: dump, snapshot, cache
 **Audit Stream**:
 A per-document cryptographic hash chain of immutable lifecycle events (`document_ingested`, `parse_failure`, `extraction`, `web_search`, `conflict_detected`, `resolution`, `attempt_failed`) serialized in canonical JSON. Run-scoped streams and compose events are planned (D-13), not yet stored.
 _Avoid_: application log, trace
+
+**Workbook**:
+The 13-tab XLSX rendered from the **Canonical Projection**. Read-only output; resolution happens in the application, not in Excel (D-10).
+_Avoid_: report, export file
+
+**Open Items**:
+The workbook tab listing what still needs a human, read from the conflict queue (ADR-002 decision 4).
+_Avoid_: todo list
+
+## Local Workspace
+
+**Local Workspace**:
+The single-user, loopback-only browser surface for reading documents and exporting a **Workbook** without an LLM endpoint. Server-rendered per D-21, with one fixed local principal in place of OIDC ([A-64](specs/001-procurement-agent/analysis.md)).
+_Avoid_: demo app, reviewer surface
