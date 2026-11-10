@@ -14,8 +14,8 @@ A-64](../../specs/001-procurement-agent/analysis.md#round-8--adr-002-registratio
 Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
 
 > **Partly overtaken by #47.** The context below describes `b295651`. PR #47 ("Make claim
-> reduction, confidentiality, and audit inserts agree") routes projection, conflict detection and
-> review through `services.claims.reduce_field` and records a review as a `human:` claim, which
+> reduction, confidentiality, and audit inserts agree") routes projection and conflict detection
+> through `services.claims.reduce_field` and records a review as a `human:` claim, which
 > delivers most of decisions 1 and 2. Each of those decisions now says what #47 did and what is
 > left. This ADR is stacked on #47 and assumes it merges first.
 
@@ -74,9 +74,12 @@ has a queue entry, and no queue entry exists for a pair the judge calls equal.
 **Delivered by #47:** `reduce_field` builds the queue from `values_conflict` over condition-
 compatible pairs, and the slice uses it. Run against #47, 650 Wp against 650.5 Wp is `none` with
 an empty queue, and 650 against 655 is `open` with one HIGH entry. `_status_for` in `project` now
-asks `values_conflict` too, so status and queue use one judge. **Left:** the slice still reduces
-only the claims whose document is in the current intake (`vertical_slice.py`, the `relevant`
-filter), not the whole component.
+asks `values_conflict` for comparable populated values. **Left:** align the remaining status
+paths with the judge and the review queue. A missing-versus-present group is still `open` while
+the judge treats it as a gap and produces no conflict entry; differing answers under
+`NEVER_COMPARE` also remain `open` without an entry. The slice still reduces only the claims
+whose document and field are in the current intake (`vertical_slice.py`, the `relevant` filter),
+not the whole component.
 
 ### 2 — The reducer is the only write path; a review is a human claim
 
@@ -86,9 +89,13 @@ review is recorded as a human claim per D-16 and linked by `claim.resolution_id`
 `sql/10_claim_resolution_link.sql` lands in the same PR; the resolution row is kept. There is no
 canonical-value table — canonical fields are always recomputed.
 
-Idempotency moves into the schema: a partial unique index on `resolution(entry_id)` restricted
-to settling actions (`select_value`, `enter_override`, `keep_system_of_record`), replacing the
-eight-column lookup in `vertical_slice.py`. `defer` and `request_more_web_search` stay
+A partial unique index on `resolution(entry_id)` restricted to settling actions
+(`select_value`, `enter_override`, `keep_system_of_record`) enforces one settlement per entry.
+The persistence path also preserves the eight-column lookup's full-payload comparison in
+`vertical_slice.py`. An exact retry returns the existing resolution ID without appending a
+resolution or audit event; a competing payload for the same settled entry is refused. If the
+index rejects a concurrent insert, the caller re-reads and compares the committed payload before
+classifying it as a retry or a competing decision. `defer` and `request_more_web_search` stay
 append-only.
 
 **Delivered by #47:** a review is a `human:` claim; after review the field is `resolved`, a
@@ -99,15 +106,24 @@ is not yet a database constraint), and reduction over the whole store (decision 
 ### 3 — A category-generic reduction stage, and a compose gate that returns
 
 **Chosen:** one reduction stage for every category, driven by the field registry rather than
-fixed CSV columns. A blocked compose returns a blocked outcome carrying the blocking entries as
-a manifest instead of raising. The only bypass is an audited `compose_override` event.
+fixed CSV columns. A blocked compose returns a blocked outcome carrying the full completeness
+manifest required by plan decision 2. It lists every unresolved conflict, including those below
+the gating threshold, every `review_required` field and every `PARSE_FAILED` page, and records
+whether the gate blocked at that threshold (Story 6, G.8). The outcome identifies the blocking
+entries separately. The only bypass is an audited `compose_override` event.
 
 ### 4 — The workbook renders the projection
 
 **Chosen:** `write_workbook` takes the projection (D-14, D-29), not components and a threshold.
-Layout lives in a render model built from the projection; tabs 8a/8b follow later. Open Items is
-read from the conflict queue, so open, low-confidence and insufficient-evidence fields all
-appear (FR-HITL-05).
+Layout lives in a render model built from the projection; tabs 8a/8b follow later. Open Items
+renders both unresolved conflict entries and `review_required` fields derived from the
+projection's flags, including low-confidence and insufficient-evidence fields with no pairwise
+conflict (FR-HITL-05; Story 6, G.7).
+
+Implement D-29's `policy.thresholds` map before the renderer refactor. Its one structural
+re-baseline adds that key to the two-supplier fixture and updates the golden digest, preserving
+the field rows and `policy_version` as D-29 requires. The renderer refactor then preserves that
+updated digest.
 
 ### 5 — Identity is derived at construction
 
@@ -196,14 +212,20 @@ said "Apache-2.0 and MIT only" is corrected in this PR.
 ## Verification
 
 - **Decision 1:** a test that 650 Wp against 650.5 Wp is neither `open` nor queued, and a
-  property test that every `open` field has exactly the queue entries the judge produces.
+  property test that every `open` field has a queue entry and every pairwise conflict entry
+  comes from the judge. Cover missing-versus-present values and `NEVER_COMPARE` separately so
+  gaps and incomparable evidence remain visible without fabricating a value conflict.
 - **Decision 2:** reviewing, re-running the reducer over the same store, and re-reviewing yields
   the same canonical field and one resolution row; a second settling resolution is refused by
-  the index.
-- **Decision 3:** a blocked compose returns its manifest; an override without an audit event is
-  impossible to construct.
-- **Decision 4:** the projection golden digest is unchanged, and Open Items lists every
-  FR-HITL-05 field.
+  the index. An exact persistence retry returns the same resolution ID and emits no new audit
+  event; a competing payload is refused, including when two writers race.
+- **Decision 3:** a blocked compose returns the full manifest, including below-threshold
+  conflicts, `review_required` fields and `PARSE_FAILED` pages, with the blockers identified
+  separately; an override without an audit event is impossible to construct.
+- **Decision 4:** D-29's one-key fixture re-baseline preserves field rows and `policy_version`;
+  the renderer refactor preserves the updated golden digest. Open Items lists unresolved
+  conflicts and every `review_required` field, including a lone low-confidence claim and an
+  insufficient-evidence field with no pairwise conflict.
 - **Decisions 5, 8:** the golden digest does not move unless `PROJECTION_VERSION` does.
 - **Decision 7:** the port contract suite passes with the new annotations pin.
 - **Decision 11:** run the workspace — a cross-origin `POST` and `DELETE` and a foreign `Host`
