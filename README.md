@@ -136,8 +136,8 @@ Requirements:
 Clone the repository and install the development environment:
 
 ```bash
-git clone https://github.com/wilsonhj/multi-agent-procurement-agent.git
-cd multi-agent-procurement-agent
+git clone https://github.com/wilsonhj/Nuclear-Solar-Contract-Procurement-Agent.git
+cd Nuclear-Solar-Contract-Procurement-Agent
 uv sync --extra dev
 ```
 
