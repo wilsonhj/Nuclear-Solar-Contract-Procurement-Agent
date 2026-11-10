@@ -51,11 +51,11 @@ The deterministic projection of an append-only set of **Field Claims** into **Ca
 _Avoid_: deduplication, merging, arbitration
 
 **Human Claim**:
-A **Field Claim** whose extractor version starts with `human:` and which carries the reviewer's **Resolution**. The only way a human decision enters the store (D-16); its row links to that resolution by `claim.resolution_id` (D-27).
+A **Field Claim** whose extractor version starts with `human:` and which carries the reviewer's value-asserting **Resolution** (`SELECT_VALUE`, `ENTER_OVERRIDE` or `KEEP_SYSTEM_OF_RECORD`). `DEFER` and `REQUEST_MORE_WEB_SEARCH` are recorded in resolution and audit records without claims (D-16). D-27 requires the human claim row to link to its resolution by `claim.resolution_id`.
 _Avoid_: manual edit, override row
 
 **Identity Keys**:
-The normalised supplier, model family and nameplate that say which **Component Instance** a claim is about (D-4). The surrogate ID is their hash, built by one factory and never assembled by a caller (ADR-002 decision 5).
+The normalised supplier, model family, variant tokens and nameplate that say which **Component Instance** a claim is about (D-4). `identity_keys` hashes all four, preserving distinct variants such as `SIL-380HC` and `SIL-380HC+`. ADR-002 decision 5 requires component construction through one factory that derives these keys.
 _Avoid_: grouping key
 
 ## Disagreement & Human Review
@@ -81,7 +81,7 @@ An immutable, attributed human decision (`SELECT_VALUE`, `KEEP_SYSTEM_OF_RECORD`
 _Avoid_: edit, hotfix, cell override
 
 **Conflict Status**:
-`none`, `open`, `insufficient_evidence` or `resolved` on a **Canonical Field**. `resolved` is derived from a settling **Human Claim**, never stored by hand (D-18). Every `open` field has a **Conflict Queue Entry**, and low-confidence and insufficient-evidence fields route to the same queue (FR-HITL-05).
+`none`, `open`, `insufficient_evidence` or `resolved` on a **Canonical Field**. `resolved` is derived from a settling **Human Claim**, never stored by hand (D-18). ADR-002 decision 1 requires every `open` field to have a queue entry. The shared review queue also includes projection-derived `review_required` fields for low-confidence and insufficient-evidence values without a pairwise conflict (FR-HITL-05).
 _Avoid_: state flag
 
 **Settling Action**:
@@ -107,7 +107,7 @@ The 13-tab XLSX rendered from the **Canonical Projection**. Read-only output; re
 _Avoid_: report, export file
 
 **Open Items**:
-The workbook tab listing what still needs a human, read from the conflict queue (ADR-002 decision 4).
+The workbook tab listing what still needs a human, rendered from unresolved conflict entries and projection-derived `review_required` fields, including fields without a pairwise conflict (ADR-002 decision 4).
 _Avoid_: todo list
 
 ## Local Workspace
