@@ -3,8 +3,8 @@
 This audit reflects the `claude/phase-1-integration` branch as verified on 2026-08-29. It
 answers the practical question a new contributor has first: what can the repository do today?
 
-The local verification baseline is **1092 passing, 42 skipped, and 4 expected failures**
-(re-measured 2026-10-27 on `main` plus the timeout and logging change; the narrative below was last
+The local verification baseline is **1199 passing, 42 skipped, and 4 expected failures**
+(re-measured 2026-10-28 on `main` plus the failure-taxonomy change; the narrative below was last
 audited on the date above and is not re-audited by that count), plus a
 clean Ruff check, a clean `ruff format --check`, and a clean strict-mypy check across `src/` and
 `tests/`. The skips are intentionally DSN-gated live tests: 32 in
@@ -158,6 +158,43 @@ logger that masks `SecretStr` values (ADR-001 decisions 3 and 7).
 **Nothing consumes either yet.** No adapter implements a port and no module logs, so no timeout
 is enforced on a real call and no log line is emitted today; the settings and the handler are the
 contract the first adapter and the runner must use. Exception text is not redacted by the logger.
+
+### Failure taxonomy
+
+`failures` defines a closed set of eight failure classes with a fixed precedence (ADR-001
+decision 4), root cause first, so that **every harness class outranks every data class, which
+outranks every model class**: when two signals are present the harness failure is the one
+reported, and an eval harness can exclude harness and unattributed attempts from an accuracy
+figure instead of scoring them as misses. `classify_exception()` reads an exception's chain by
+type, never by message: `__cause__`, `__context__` (unless severed with `raise ... from None`)
+and the members of an `ExceptionGroup`, reading at most 64 distinct exceptions. If it cannot read
+the whole chain, only the top class (`contract_violation`) is trusted and everything else becomes
+`unknown`, which quarantines: a lower class found early cannot be trusted while a higher one may
+sit unread. Cancellation and `KeyboardInterrupt` are not failures and also classify as `unknown`,
+so the runner must handle them before classifying. `log_context()` produces `extra=` context for
+the JSON logger without the message. Each class names a disposition (`retry` or `quarantine`,
+tasks I.2 and I.4), a fault group, the `job.status` values it may write, and an existing
+`audit.event` type.
+
+**A type is evidence only when the type alone implies the cause.** The programming-error
+invariants (`AutonomousOverwriteError`, `StoredValueLossError`, ...) are registered by type.
+Validation rejections are not: `OffContractFieldError` and `VocabularyError` are raised for
+supplier data, caller bugs and model output alike, so the code that knows tags its error with a
+`ClassifiedError` subclass, whose tag is validated when the class is defined and is combined with
+any registered type the exception also is (an `OcrTimeout(ClassifiedError, TimeoutError)` is a
+`timeout`, as it would be were the two facts split across a cause chain). For the same reason `store_failure`, `adapter_failure`,
+`unparseable_document` and `schema_violation` are reachable only by tag; no exception type in
+the package implies them. A test fails if an exception is added to the package without being
+classified or listed as unclassified by design with a reason.
+
+Two other judgement calls are recorded rather than hidden. An LLM returning `None` (FR-RAG-04,
+insufficient evidence) is a result, not a failure, and has no class. `DeclaredBandUnitError` is
+unclassified for the same reason as the validation errors: nothing says whether a unit mismatch
+comes from supplier data or from a caller bug, and no pipeline raise site exists to decide.
+
+**Nothing raises into it yet.** No runner exists, so no job is retried or quarantined by class
+today, and no adapter or stage tags an error; the taxonomy is the contract the C8 runner, the
+first adapters and the B.9 eval harness must use.
 
 ## Declared but not operational
 
