@@ -21,14 +21,17 @@ Python fidelity, and ECMAScript number rules collapsing `650.0` to `650` is a
 price C4 pays. The workbook projection cannot pay it, because that int/float
 distinction is data the store genuinely carries.
 
-**Deferred, and named here so the boundary is not read as permanent.** D-13 also
-assigns WP-H a separately chained `audit.run_event` table for run-scoped events
-- gap-triggered web searches (A-49) and the `--accept-incomplete` compose-gate
-override - and the taxonomy amendment removing the `web_search` value that
-`audit.event` structurally cannot store. Both need `sql/` changes, and both land
-with WP-H's first emitter. `recorded_at` no longer has a `DEFAULT
-clock_timestamp()`: section 4's caller-supplied value is required at INSERT.
-Updating `sql/README.md` decisions 5-7 remains outstanding.
+**Two chains, one envelope (P2-C7).** Document-scoped events go to
+`audit.event` through `append_event`; run-scoped events - gap-triggered web
+searches (A-49), the `--accept-incomplete` compose-gate override, run start and
+finish - go to `audit.run_event` (`sql/11`) through `append_run_event`. D-13
+requires the second to reuse the first's envelope and lock discipline
+"verbatim", and it does: both builders seal through one function, and the
+stream string (`doc:` or `run:`) is the only input that differs. `sql/12`
+removed `web_search` from `audit.event`'s taxonomy, which could never store it.
+`recorded_at` has no default on either table: section 4's caller-supplied value
+is required at INSERT. Updating `sql/README.md` decisions 5-7 remains
+outstanding.
 """
 
 from __future__ import annotations
@@ -44,16 +47,23 @@ from .envelope import (
     ENVELOPE_VERSION,
     EVENT_TYPES_V1,
     KNOWN_ENVELOPE_VERSIONS,
+    RUN_EVENT_TYPES_V1,
+    RUN_STREAM_PREFIX,
     STREAM_PREFIX,
     AuditEvent,
     ChainTip,
+    RunAuditEvent,
     UnknownEventTypeError,
     build_event,
     build_preimage,
+    build_run_event,
     digest_of,
     document_id_for_stream,
     format_recorded_at,
+    run_id_for_stream,
     stream_for_document,
+    stream_for_run,
+    taxonomy_for_stream,
 )
 from .verify import (
     ChainDefect,
@@ -65,12 +75,23 @@ from .verify import (
     verify_events,
     verify_stream,
 )
-from .writer import AuditConnection, append_event, insert_event, lock_stream, read_chain_tip
+from .writer import (
+    AuditConnection,
+    append_event,
+    append_run_event,
+    insert_event,
+    insert_run_event,
+    lock_stream,
+    read_chain_tip,
+    read_run_chain_tip,
+)
 
 __all__ = [
     "ENVELOPE_VERSION",
     "EVENT_TYPES_V1",
     "KNOWN_ENVELOPE_VERSIONS",
+    "RUN_EVENT_TYPES_V1",
+    "RUN_STREAM_PREFIX",
     "STREAM_PREFIX",
     "AuditConnection",
     "AuditEvent",
@@ -81,22 +102,30 @@ __all__ = [
     "DefectKind",
     "JsonObject",
     "JsonValue",
+    "RunAuditEvent",
     "StoredEvent",
     "UnknownEventTypeError",
     "append_event",
+    "append_run_event",
     "build_event",
     "build_preimage",
+    "build_run_event",
     "canonical_text",
     "canonicalise",
     "digest_of",
     "document_id_for_stream",
     "format_recorded_at",
     "insert_event",
+    "insert_run_event",
     "lock_stream",
     "read_chain_tip",
     "read_events",
+    "read_run_chain_tip",
     "read_streams",
+    "run_id_for_stream",
     "stream_for_document",
+    "stream_for_run",
+    "taxonomy_for_stream",
     "verify_events",
     "verify_stream",
 ]

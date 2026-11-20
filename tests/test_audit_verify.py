@@ -41,6 +41,7 @@ from procurement_agent.audit import (
     StoredEvent,
     build_event,
     build_preimage,
+    build_run_event,
     digest_of,
     format_recorded_at,
     verify_events,
@@ -728,3 +729,128 @@ def test_cli_falls_back_to_procurement_database_url_env(
     refused = capsys.readouterr()
     assert "--dsn is refused" in (refused.out + refused.err)
     assert captured_dsn == ["postgresql://env-host/procurement"]
+
+
+# --- run-scoped chains (P2-C7) ----------------------------------------------------
+
+RUN_STREAM = "run:run-1"
+
+
+def _run_chain(
+    types: tuple[str, ...] = ("run_started", "web_search", "run_finished"),
+) -> list[StoredEvent]:
+    """A well-formed run chain, built by `build_run_event` - the writer's path."""
+    stored: list[StoredEvent] = []
+    tip: ChainTip | None = None
+    for index, event_type in enumerate(types):
+        event = build_run_event(
+            run_id="run-1",
+            event_type=event_type,
+            actor="runner",
+            payload={"index": index},
+            recorded_at=RECORDED_AT,
+            tip=tip,
+        )
+        stored.append(
+            StoredEvent(
+                event_id=index + 1,
+                seq=event.seq,
+                prev_hash=event.prev_hash,
+                hash=event.hash,
+                event_type=event.event_type,
+                actor=event.actor,
+                payload_canonical=event.payload_canonical,
+                recorded_at=event.recorded_at,
+            )
+        )
+        tip = ChainTip(seq=event.seq, hash=event.hash)
+    return stored
+
+
+def test_a_run_chain_verifies() -> None:
+    """`verify.py` verifies both stream kinds (story 4 section A.4)."""
+    report = verify_events(RUN_STREAM, _run_chain())
+    assert report.ok, report.defects
+    assert report.events == 3
+
+
+def test_a_run_chain_verified_under_a_document_stream_name_fails() -> None:
+    """The stream is inside the preimage, so the same rows read as `doc:run-1`
+    fail on every digest - and on every type, because the document taxonomy
+    holds none of them. A row cannot be moved between tables and still verify.
+    """
+    kinds = {d.kind for d in verify_events("doc:run-1", _run_chain()).defects}
+    assert DefectKind.HASH_MISMATCH in kinds
+    assert DefectKind.UNKNOWN_EVENT_TYPE in kinds
+
+
+def test_a_document_type_inside_a_run_chain_is_flagged() -> None:
+    """`extraction` is a legal type - in the other table. Sealed into a run
+    chain by hand (`build_run_event` would refuse it), the digest verifies and
+    only the per-stream taxonomy check notices, which is why it is per stream.
+    """
+    rows = _run_chain(("run_started",))
+    first = rows[0]
+    payload = json.loads(first.payload_canonical)
+    forged_hash = digest_of(
+        build_preimage(
+            version=ENVELOPE_VERSION,
+            stream=RUN_STREAM,
+            seq=1,
+            event_type="extraction",
+            actor="runner",
+            recorded_at=format_recorded_at(RECORDED_AT),
+            prev_hash=first.hash,
+            payload=payload,
+        )
+    )
+    rows.append(
+        dataclasses.replace(
+            first,
+            event_id=2,
+            seq=1,
+            prev_hash=first.hash,
+            hash=forged_hash,
+            event_type="extraction",
+        )
+    )
+    defects = verify_events(RUN_STREAM, rows).defects
+    assert [d.kind for d in defects] == [DefectKind.UNKNOWN_EVENT_TYPE]
+    assert defects[0].seq == 1
+
+
+def test_a_stream_of_neither_kind_is_reported_not_raised() -> None:
+    """`verify_events` never raises. A stream with no recognised prefix becomes
+    one `unknown_stream` defect and the rows are still walked, so a bad name
+    cannot hide findings on the rows themselves."""
+    report = verify_events("global", _run_chain())
+    kinds = [d.kind for d in report.defects]
+    assert kinds.count(DefectKind.UNKNOWN_STREAM) == 1
+    assert DefectKind.HASH_MISMATCH in kinds
+
+
+def test_a_self_parented_row_is_reported_as_a_broken_link() -> None:
+    """The plant `sql/12` and `sql/11` now make unwritable, checked here for the
+    case where it got in anyway (an older database, a superuser). The walk is in
+    `seq` order and compares each row with the one before it, so a row naming
+    *itself* as parent is a broken link - it does not send the walk in a loop.
+    """
+    rows = _run_chain(("run_started", "run_finished"))
+    planted = rows[1]
+    rows[1] = dataclasses.replace(planted, prev_hash=planted.hash)
+    kinds = {d.kind for d in verify_events(RUN_STREAM, rows).defects}
+    assert DefectKind.BROKEN_LINK in kinds
+
+
+def test_the_cli_accepts_a_run_stream_name(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--stream run:ID` must pass the pre-connection prefix check. Without a
+    server the CLI then fails to *connect* (exit 2 from psycopg or from the
+    missing driver) - what matters is that it did not refuse the name."""
+    monkeypatch.setenv("PROCUREMENT_DATABASE_URL", "postgresql://127.0.0.1:1/none")
+    try:
+        verify_main(["--stream", "run:run-1"])
+    except Exception:  # noqa: BLE001 - a connection error means the name was accepted
+        pass
+    assert "is neither document-scoped" not in capsys.readouterr().out

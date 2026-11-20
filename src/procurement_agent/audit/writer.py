@@ -46,9 +46,26 @@ from datetime import datetime
 from typing import Any, LiteralString, Protocol
 
 from .canonical import JsonObject
-from .envelope import AuditEvent, ChainTip, build_event, stream_for_document
+from .envelope import (
+    AuditEvent,
+    ChainTip,
+    RunAuditEvent,
+    build_event,
+    build_run_event,
+    stream_for_document,
+    stream_for_run,
+)
 
-__all__ = ["AuditConnection", "append_event", "insert_event", "lock_stream", "read_chain_tip"]
+__all__ = [
+    "AuditConnection",
+    "append_event",
+    "append_run_event",
+    "insert_event",
+    "insert_run_event",
+    "lock_stream",
+    "read_chain_tip",
+    "read_run_chain_tip",
+]
 
 #: Step 1. `hashtext` is an internal PostgreSQL function whose value is not
 #: promised stable across major versions, which does not matter here: the lock
@@ -77,6 +94,21 @@ _TIP_SQL: LiteralString = (
 _INSERT_SQL: LiteralString = """
 INSERT INTO audit.event
     (stream, document_id, seq, prev_hash, hash, event_type, actor,
+     payload_canonical, recorded_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
+#: Steps 2 and 4 for `audit.run_event` (`sql/11`, P2-C7). Separate constants
+#: rather than a table-name parameter: `LiteralString` exists so that no SQL in
+#: this module is ever assembled from a runtime string, and keeping that true is
+#: worth two more lines.
+_RUN_TIP_SQL: LiteralString = (
+    "SELECT seq, hash FROM audit.run_event WHERE stream = %s ORDER BY seq DESC LIMIT 1"
+)
+
+_RUN_INSERT_SQL: LiteralString = """
+INSERT INTO audit.run_event
+    (stream, run_id, seq, prev_hash, hash, event_type, actor,
      payload_canonical, recorded_at)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
@@ -202,4 +234,70 @@ def append_event(
         tip=tip,
     )
     insert_event(conn, event)
+    return event
+
+
+def read_run_chain_tip(conn: AuditConnection, stream: str) -> ChainTip | None:
+    """Step 2 for a run chain. Same contract as `read_chain_tip`."""
+    row = conn.execute(_RUN_TIP_SQL, (stream,)).fetchone()
+    if row is None:
+        return None
+    return ChainTip(seq=int(row[0]), hash=bytes(row[1]))
+
+
+def insert_run_event(conn: AuditConnection, event: RunAuditEvent) -> None:
+    """Step 4 for a run chain, in the caller's transaction. Does not commit."""
+    conn.execute(
+        _RUN_INSERT_SQL,
+        (
+            event.stream,
+            event.run_id,
+            event.seq,
+            event.prev_hash,
+            event.hash,
+            event.event_type,
+            event.actor,
+            event.payload_canonical,
+            event.recorded_at,
+        ),
+    )
+
+
+def append_run_event(
+    conn: AuditConnection,
+    *,
+    run_id: str,
+    event_type: str,
+    actor: str,
+    payload: JsonObject,
+    recorded_at: datetime,
+) -> RunAuditEvent:
+    """All four steps for `audit.run_event` - P2-C7's named entry point.
+
+    The signature is the one story 4 section A.4 freezes:
+    `append_run_event(conn, *, run_id, event_type, actor, payload, recorded_at)`.
+    The sequence is `append_event`'s exactly, and for the same reasons: the lock
+    is its own statement, the tip is read under it, nothing commits here. The
+    lock is taken through the same `lock_stream`, keyed on the `run:` stream
+    string - so a run's chain serialises against itself and against nothing
+    else, barring a 32-bit `hashtext` collision, which costs waiting and never
+    correctness.
+
+    Gap-triggered web searches, the `--accept-incomplete` override, and run
+    start and finish land here (D-13). ⚠️ This table has no row-level security:
+    a payload must reference documents and conflicts by id, never quote their
+    content. See `sql/11_audit_run_event.sql`.
+    """
+    stream = stream_for_run(run_id)
+    lock_stream(conn, stream)
+    tip = read_run_chain_tip(conn, stream)
+    event = build_run_event(
+        run_id=run_id,
+        event_type=event_type,
+        actor=actor,
+        payload=payload,
+        recorded_at=recorded_at,
+        tip=tip,
+    )
+    insert_run_event(conn, event)
     return event

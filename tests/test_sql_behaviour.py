@@ -220,7 +220,7 @@ def schema() -> None:
         # cluster hardened with `REVOKE ALL ON SCHEMA public FROM PUBLIC` would
         # break the application with nothing in these files to explain why.
         conn.execute("GRANT USAGE, CREATE ON SCHEMA public TO PUBLIC")
-        for path in sorted(SQL_DIR.glob("0*.sql")):
+        for path in sorted(SQL_DIR.glob("[0-9][0-9]*.sql")):
             conn.execute(path.read_text(encoding="utf-8"))
 
         # Credentials, supplied by the harness rather than by the DDL — see

@@ -68,16 +68,23 @@ __all__ = [
     "ENVELOPE_VERSION",
     "EVENT_TYPES_V1",
     "KNOWN_ENVELOPE_VERSIONS",
+    "RUN_EVENT_TYPES_V1",
+    "RUN_STREAM_PREFIX",
     "STREAM_PREFIX",
     "AuditEvent",
     "ChainTip",
+    "RunAuditEvent",
     "UnknownEventTypeError",
     "build_event",
     "build_preimage",
+    "build_run_event",
     "digest_of",
     "document_id_for_stream",
     "format_recorded_at",
+    "run_id_for_stream",
     "stream_for_document",
+    "stream_for_run",
+    "taxonomy_for_stream",
 ]
 
 #: D-13 section 3. Inside the preimage, and load-bearing: without it, changing
@@ -99,28 +106,48 @@ ENVELOPE_VERSION = 1
 #: second entry in this tuple is the moment the cost becomes real.
 KNOWN_ENVELOPE_VERSIONS = (ENVELOPE_VERSION,)
 
-#: D-13 section 5: version 1 of C4's taxonomy. Additions are allowed by
+#: D-13 section 5: C4's taxonomy for `audit.event`. Additions are allowed by
 #: amendment to that decision - which is why `sql/07` chose a CHECK over a
 #: native enum - and removals and renames are forbidden once any event exists,
 #: because that is what a chain cannot tolerate.
 #:
-#: `web_search` is here because the CHECK has it, and for no better reason.
-#: A-49: `audit.event.document_id` is `NOT NULL REFERENCES public.document`, and
-#: a gap-triggered web search happens precisely because no document supplied the
-#: value, so the row it would describe cannot exist. D-13 routes those events to
-#: a separately chained `audit.run_event` table instead. Removing the value is a
-#: taxonomy amendment plus a `sql/` change, and it belongs with the first
-#: emitter - `tests/test_audit_envelope.py` asserts this set equals the CHECK,
-#: so the two must move together when it happens.
+#: **Six values, not seven: `web_search` left with `sql/12` (P2-C7).** It was
+#: never storable here. `audit.event.document_id` is `NOT NULL REFERENCES
+#: public.document`, and a gap-triggered web search happens precisely because no
+#: document supplied the value (A-49). That is also why removing it does not
+#: breach section 5's prohibition: the prohibition protects rows that use a
+#: value, and the FK made such a row unrepresentable in every deployment.
+#: `sql/12` checks anyway before it drops the value. The event now lives in
+#: `RUN_EVENT_TYPES_V1`.
+#:
+#: Still named `_V1`: this is the taxonomy's identity, not the envelope version.
+#: The `"v": 1` inside the preimage is `ENVELOPE_VERSION`, and no digest changes.
+#: `tests/test_audit_envelope.py` holds this set equal to the effective CHECK.
 EVENT_TYPES_V1 = frozenset(
     {
         "document_ingested",
         "parse_failure",
         "extraction",
-        "web_search",
         "conflict_detected",
         "resolution",
         "attempt_failed",
+    }
+)
+
+#: The run-scoped taxonomy - `audit.run_event`'s CHECK in `sql/11` (P2-C7).
+#:
+#: `web_search` is the gap-triggered query log (FR-WEB-01, NFR-02 names "web
+#: queries" explicitly); `compose_override` is the `--accept-incomplete`
+#: decision, which D-13 calls the highest-repudiation-risk record in the
+#: system; `run_started` and `run_finished` bracket a run so that a chain with a
+#: start and no finish is legible as an interrupted run rather than a quiet one.
+#: Section 5's rules apply unchanged.
+RUN_EVENT_TYPES_V1 = frozenset(
+    {
+        "web_search",
+        "compose_override",
+        "run_started",
+        "run_finished",
     }
 )
 
@@ -128,6 +155,11 @@ EVENT_TYPES_V1 = frozenset(
 #: document "not globally, so cross-document concurrency stays unconstrained",
 #: and the DDL makes that structural rather than conventional.
 STREAM_PREFIX = "doc:"
+
+#: `CHECK (stream = 'run:' || run_id)` in `sql/11`. Disjoint from
+#: `STREAM_PREFIX` by construction, which is what lets the stream string alone
+#: say which table - and which taxonomy - a chain belongs to.
+RUN_STREAM_PREFIX = "run:"
 
 
 class UnknownEventTypeError(ValueError):
@@ -194,6 +226,74 @@ def document_id_for_stream(stream: str) -> str:
             f"{STREAM_PREFIX!r} || document_id; Decision 9 has no global chain."
         )
     return stream[len(STREAM_PREFIX) :]
+
+
+@dataclass(frozen=True, slots=True)
+class RunAuditEvent:
+    """A row of `audit.run_event`, with its digest already computed.
+
+    A separate type rather than `AuditEvent` with an optional `document_id`,
+    because the two tables differ in exactly that column and an optional field
+    would let a run event reach `audit.event`'s INSERT with a `None` document -
+    a type error turned into a constraint violation three layers down.
+    """
+
+    stream: str
+    run_id: str
+    seq: int
+    prev_hash: bytes | None
+    hash: bytes
+    event_type: str
+    actor: str
+    payload_canonical: str
+    recorded_at: datetime
+
+
+def stream_for_run(run_id: str) -> str:
+    """The stream name for a run, in one place (`sql/11`'s CHECK).
+
+    Raises:
+        ValueError: on an empty run id. `run:` alone names no run, and the
+            table's `CHECK (run_id <> '')` would reject it with a constraint
+            name rather than this sentence.
+    """
+    if not run_id:
+        raise ValueError("run_id must be non-empty: 'run:' alone names no run (sql/11).")
+    return RUN_STREAM_PREFIX + run_id
+
+
+def run_id_for_stream(stream: str) -> str:
+    """The inverse of `stream_for_run`, for the verifier.
+
+    Raises:
+        ValueError: if `stream` is not run-scoped.
+    """
+    if not stream.startswith(RUN_STREAM_PREFIX) or len(stream) == len(RUN_STREAM_PREFIX):
+        raise ValueError(
+            f"{stream!r} is not a run-scoped stream. sql/11 constrains every stream to "
+            f"{RUN_STREAM_PREFIX!r} || run_id."
+        )
+    return stream[len(RUN_STREAM_PREFIX) :]
+
+
+def taxonomy_for_stream(stream: str) -> frozenset[str]:
+    """The event types a stream may hold, decided by its prefix alone.
+
+    The verifier needs this because it starts from a stream name, and a
+    document chain holding `compose_override` - or a run chain holding
+    `extraction` - is a defect even though the type is legal *somewhere*.
+
+    Raises:
+        ValueError: if the stream is neither document- nor run-scoped.
+    """
+    if stream.startswith(STREAM_PREFIX) and len(stream) > len(STREAM_PREFIX):
+        return EVENT_TYPES_V1
+    if stream.startswith(RUN_STREAM_PREFIX) and len(stream) > len(RUN_STREAM_PREFIX):
+        return RUN_EVENT_TYPES_V1
+    raise ValueError(
+        f"{stream!r} is neither document-scoped ({STREAM_PREFIX!r}) nor run-scoped "
+        f"({RUN_STREAM_PREFIX!r}); Decision 9 has no global chain."
+    )
 
 
 def format_recorded_at(moment: datetime) -> str:
@@ -310,11 +410,107 @@ def build_event(
         TypeError: if `payload` is not a JSON object.
         CanonicalisationError: if any value in `payload` has no JCS form.
     """
-    if event_type not in EVENT_TYPES_V1:
+    sealed = _seal(
+        stream=stream_for_document(document_id),
+        taxonomy=EVENT_TYPES_V1,
+        ddl_file="sql/07_audit_event.sql and sql/12_audit_event_taxonomy.sql",
+        event_type=event_type,
+        actor=actor,
+        payload=payload,
+        recorded_at=recorded_at,
+        tip=tip,
+    )
+    return AuditEvent(
+        stream=sealed.stream,
+        document_id=document_id,
+        seq=sealed.seq,
+        prev_hash=sealed.prev_hash,
+        hash=sealed.hash,
+        event_type=event_type,
+        actor=actor,
+        payload_canonical=sealed.payload_canonical,
+        recorded_at=recorded_at,
+    )
+
+
+def build_run_event(
+    *,
+    run_id: str,
+    event_type: str,
+    actor: str,
+    payload: JsonObject,
+    recorded_at: datetime,
+    tip: ChainTip | None,
+) -> RunAuditEvent:
+    """Build the next event for a run's chain, digest included (P2-C7).
+
+    The same preimage, the same digest and the same taxonomy discipline as
+    `build_event` - D-13 says run events reuse "WP-H's envelope and lock
+    discipline verbatim" - with `run:<run_id>` as the stream and
+    `RUN_EVENT_TYPES_V1` as the vocabulary. Normally reached through
+    `writer.append_run_event`, which reads `tip` under the advisory lock.
+
+    Raises:
+        ValueError: on an empty `run_id`.
+        UnknownEventTypeError: on a type outside the run-scoped taxonomy -
+            including the document-scoped types, which belong to `build_event`.
+        TypeError: if `payload` is not a JSON object.
+        CanonicalisationError: if any value in `payload` has no JCS form.
+    """
+    sealed = _seal(
+        stream=stream_for_run(run_id),
+        taxonomy=RUN_EVENT_TYPES_V1,
+        ddl_file="sql/11_audit_run_event.sql",
+        event_type=event_type,
+        actor=actor,
+        payload=payload,
+        recorded_at=recorded_at,
+        tip=tip,
+    )
+    return RunAuditEvent(
+        stream=sealed.stream,
+        run_id=run_id,
+        seq=sealed.seq,
+        prev_hash=sealed.prev_hash,
+        hash=sealed.hash,
+        event_type=event_type,
+        actor=actor,
+        payload_canonical=sealed.payload_canonical,
+        recorded_at=recorded_at,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _Sealed:
+    stream: str
+    seq: int
+    prev_hash: bytes | None
+    hash: bytes
+    payload_canonical: str
+
+
+def _seal(
+    *,
+    stream: str,
+    taxonomy: frozenset[str],
+    ddl_file: str,
+    event_type: str,
+    actor: str,
+    payload: JsonObject,
+    recorded_at: datetime,
+    tip: ChainTip | None,
+) -> _Sealed:
+    """Everything the two builders share: validation, chain position, digest.
+
+    One function so that a document event and a run event cannot be hashed by
+    two implementations that drift - the property D-13 asks for when it says
+    "verbatim". The stream string is the only input that differs.
+    """
+    if event_type not in taxonomy:
         raise UnknownEventTypeError(
-            f"{event_type!r} is not in C4's v1 event taxonomy "
-            f"({', '.join(sorted(EVENT_TYPES_V1))}). Adding a value is an additive amendment "
-            "to clarifications.md D-13 plus the CHECK in sql/07_audit_event.sql; removing or "
+            f"{event_type!r} is not in this stream's C4 v1 event taxonomy "
+            f"({', '.join(sorted(taxonomy))}). Adding a value is an additive amendment "
+            f"to clarifications.md D-13 plus the CHECK in {ddl_file}; removing or "
             "renaming one is forbidden once any event exists."
         )
     # `payload jsonb` would accept a bare scalar and so would JCS, so nothing
@@ -330,11 +526,9 @@ def build_event(
 
     seq = 0 if tip is None else tip.seq + 1
     prev_hash = None if tip is None else tip.hash
-    stream = stream_for_document(document_id)
     plain_payload = _as_plain_object(payload)
-    return AuditEvent(
+    return _Sealed(
         stream=stream,
-        document_id=document_id,
         seq=seq,
         prev_hash=prev_hash,
         hash=digest_of(
@@ -349,10 +543,7 @@ def build_event(
                 payload=plain_payload,
             )
         ),
-        event_type=event_type,
-        actor=actor,
         # JCS of the payload alone. The verifier recomputes the envelope around
         # it; this column is never the thing that gets hashed.
         payload_canonical=canonical_text(plain_payload),
-        recorded_at=recorded_at,
     )

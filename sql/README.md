@@ -36,6 +36,8 @@ gets the dependency order right automatically:
 | `08_job.sql` | `job` (stage state machine) + RLS | `02` |
 | `09_claim_natural_key_condition.sql` | fold `condition` into `claim_natural_key` | `04` |
 | `09a_hardening_catch_up.sql` | idempotent catch-up for databases that applied `01`–`09` before their in-place hardening: schema privileges, function `search_path`, `chunk` write revoke, `conflict_candidate` RLS, `recorded_at` default drop, `NULLS NOT DISTINCT` key, confidential-type CHECK. Named `09a` because D-27 assigns `10` | `00`–`09` |
+| `11_audit_run_event.sql` | `audit.run_event` (P2-C7, D-13): the run-scoped chain, stream `run:<run_id>`, same envelope and preimage as `audit.event`; types `web_search`, `compose_override`, `run_started`, `run_finished`; `no_self_parent` from creation; **no RLS** — emitters must reference documents by id, never quote them. Also generalises `audit.reject_mutation()` / `reject_truncate()` to name the table that fired | `00`, `01`, `07` |
+| `12_audit_event_taxonomy.sql` | idempotent `audit.event` amendments: `web_search` leaves the taxonomy (guarded: refuses if any such row exists), `recorded_at` DEFAULT drop (already done by `09a`; repeated per P2-C7), `audit_event_no_self_parent` | `07`, `09a`, `11` |
 
 Two shared helpers cross file boundaries: `02_document.sql` defines
 `public.document_is_restricted(text)`, the confidentiality derivation every table
@@ -46,10 +48,32 @@ Both are `SECURITY DEFINER`; decision 10 below says why.
 Apply with, e.g.:
 
 ```sh
-for f in sql/0*.sql; do
+export LC_ALL=C
+for f in sql/[0-9][0-9]*.sql; do
   psql -v ON_ERROR_STOP=1 -f "$f" "$DATABASE_URL"
 done
 ```
+
+**The glob is `[0-9][0-9]*.sql`, and both halves of that are deliberate.** It
+was `0*.sql` until P2-C7, which matches nothing from `10_` on. Under it, this
+loop skips `sql/11` and `sql/12` without a word, and a deployment ends up with
+no `audit.run_event` and the old taxonomy; the live tests at least fail loudly,
+on `relation "audit.run_event" does not exist`. The phase-2 plan's suggested
+replacement, `[0-9][0-9]_*.sql`, has the opposite defect and it is the quieter
+one: it requires `_` as the third character, so it drops
+`09a_hardening_catch_up.sql` — and **the whole live suite stays green without
+it** (measured: 53 of 53), because `09a` is a catch-up for databases that
+predate in-place edits and a greenfield apply already has its effects. Only an
+operator upgrading a real database would find out.
+`tests/test_sql_schema.py::test_every_apply_glob_applies_every_sql_file` holds
+all four copies of the glob (this loop and three test fixtures) to *every*
+`.sql` file in this directory, which is the comparison that catches both.
+
+`LC_ALL=C` because a shell glob sorts by the locale's collation, not by byte,
+and apply order is load-bearing here (`09_` must precede `09a_`). The test
+fixtures sort with Python's `sorted()`, which is byte order; pinning the
+collation makes this loop agree with them rather than with whatever the
+operator's shell happens to be set to.
 
 `ON_ERROR_STOP=1` matters: without it, `psql` keeps going past a failed
 statement and a broken migration can look like it "applied."

@@ -28,7 +28,13 @@ from typing import Any, LiteralString
 
 import pytest
 
-from procurement_agent.audit import ChainTip, JsonObject, append_event, read_chain_tip
+from procurement_agent.audit import (
+    ChainTip,
+    JsonObject,
+    append_event,
+    append_run_event,
+    read_chain_tip,
+)
 
 RECORDED_AT = datetime(2026, 8, 6, 15, 4, 5, tzinfo=UTC)
 PAYLOAD: JsonObject = {"field": "price_per_watt_dc", "value": 0.19}
@@ -64,7 +70,7 @@ class _RecordingConnection:
 
     def execute(self, query: LiteralString, params: Sequence[object] | None = None) -> _Cursor:
         self.statements.append((query, params))
-        if "FROM audit.event" in query:
+        if "FROM audit.event" in query or "FROM audit.run_event" in query:
             return _Cursor(self._tip)
         return _Cursor(None)
 
@@ -181,3 +187,62 @@ def test_a_a_stream_with_no_rows_reads_as_no_tip() -> None:
 def test_a_a_stream_with_rows_reads_as_its_tip() -> None:
     conn = _RecordingConnection(tip=(4, PARENT))
     assert read_chain_tip(conn, "doc:open-1") == ChainTip(seq=4, hash=PARENT)
+
+
+# --- run-scoped events (P2-C7) ----------------------------------------------------
+
+
+def _append_run(conn: _RecordingConnection) -> None:
+    append_run_event(
+        conn,
+        run_id="run-1",
+        event_type="compose_override",
+        actor="alice@example.invalid",
+        payload=PAYLOAD,
+        recorded_at=RECORDED_AT,
+    )
+
+
+def test_append_run_event_runs_the_same_three_statements_on_its_own_table() -> None:
+    """D-13: "reusing WP-H's envelope and lock discipline verbatim".
+
+    The same lock statement, keyed on the `run:` stream; the tip read and the
+    INSERT against `audit.run_event` and **never** `audit.event`. A run event
+    written to the document table would fail on the document FK - loudly - but
+    a tip read from the wrong table would succeed and return the wrong parent.
+    """
+    conn = _RecordingConnection(tip=(0, PARENT))
+    _append_run(conn)
+
+    assert len(conn.statements) == 3
+    lock, read, insert = conn.statements
+    assert "pg_advisory_xact_lock" in lock[0] and "hashtext(%s)" in lock[0]
+    assert lock[1] == ("run:run-1",)
+    assert "FROM audit.run_event" in read[0] and read[1] == ("run:run-1",)
+    assert insert[0].lstrip().upper().startswith("INSERT INTO AUDIT.RUN_EVENT")
+    assert all("audit.event" not in query for query, _ in conn.statements)
+
+
+def test_append_event_never_touches_the_run_table() -> None:
+    """The converse, so neither entry point can drift into the other's table."""
+    conn = _RecordingConnection(tip=(0, PARENT))
+    _append(conn)
+    assert all("run_event" not in query for query, _ in conn.statements)
+
+
+def test_append_run_event_refuses_autocommit_too() -> None:
+    """The lock-is-a-no-op configuration is refused for run chains as well; it
+    comes from the shared `lock_stream`, so this pins that it stays shared."""
+    conn = _RecordingConnection(autocommit=True)
+    with pytest.raises(ValueError, match="autocommit"):
+        _append_run(conn)
+    assert conn.statements == []
+
+
+def test_append_run_event_chains_off_the_tip_it_read() -> None:
+    conn = _RecordingConnection(tip=(4, PARENT))
+    _append_run(conn)
+    params = conn.statements[2][1]
+    assert params is not None
+    stream, run_id, seq, prev_hash = params[0], params[1], params[2], params[3]
+    assert (stream, run_id, seq, prev_hash) == ("run:run-1", "run-1", 5, PARENT)

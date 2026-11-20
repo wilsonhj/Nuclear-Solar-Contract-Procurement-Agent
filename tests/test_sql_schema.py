@@ -62,7 +62,68 @@ def _statements(text: str) -> list[str]:
     return [s.strip() for s in without_comments.split(";") if s.strip()]
 
 
-ALL_FILES = sorted(p.name for p in SQL_DIR.glob("0*.sql"))
+ALL_FILES = sorted(p.name for p in SQL_DIR.glob("[0-9][0-9]*.sql"))
+
+
+def _apply_globs() -> list[tuple[str, str]]:
+    """Every `(location, pattern)` the repository uses to pick `sql/` files.
+
+    Read out of the sources rather than restated, because restating them is how
+    four copies drifted to one value and stayed there. A list, not a dict keyed
+    by file: the first version of this helper was a dict, and in this very file
+    the reference glob below (`*.sql`) overwrote `ALL_FILES`'s real one, so the
+    guard silently stopped checking the file it lives in.
+    """
+    tests_dir = pathlib.Path(__file__).parent
+    found: list[tuple[str, str]] = []
+    for source in sorted(tests_dir.glob("test_*.py")):
+        for pattern in re.findall(r'SQL_DIR\.glob\("([^"]+\.sql)"\)', source.read_text("utf-8")):
+            found.append((f"tests/{source.name}", pattern))
+    readme = (SQL_DIR / "README.md").read_text("utf-8")
+    loop = re.search(r"for f in sql/(\S+\.sql); do", readme)
+    assert loop is not None, "sql/README.md no longer documents an apply loop where this looks"
+    found.append(("sql/README.md", loop.group(1)))
+    return found
+
+
+def test_every_apply_glob_applies_every_sql_file() -> None:
+    """Each apply-glob must match **every** `.sql` file in `sql/`, not a subset.
+
+    `test_the_expected_files_are_all_present` cannot see this failure. It
+    compares the glob's output to a hand-written list, so a file the glob
+    misses is missing from both sides and the test passes. Two misses were
+    live at once when this was written:
+
+    - `0*.sql`, the value all four copies held, matches nothing from `10_` on.
+      The live tests would at least have errored on the missing
+      `audit.run_event`; the operator's loop in `sql/README.md` would have
+      skipped `sql/11` and `sql/12` without a word.
+    - `[0-9][0-9]_*.sql`, the phase-2 plan's own suggested replacement, needs
+      `_` as the third character and so drops `09a_hardening_catch_up.sql` -
+      and the entire live suite stays green without it, because `09a` only
+      catches up databases that predate in-place edits. Nothing but this test
+      would notice.
+
+    Comparing against the full directory listing catches both directions.
+    """
+    every_sql_file = sorted(p.name for p in SQL_DIR.glob("*.sql"))
+    globs = _apply_globs()
+    # The four sites that *apply* the schema must be among those found - a
+    # renamed variable would otherwise drop one out of the check silently.
+    sites = {where for where, _ in globs}
+    for required in (
+        "sql/README.md",
+        "tests/test_sql_behaviour.py",
+        "tests/test_sql_schema.py",
+        "tests/test_audit_live.py",
+    ):
+        assert required in sites, f"{required}'s apply-glob is no longer where this test looks"
+    for where, pattern in globs:
+        applied = sorted(p.name for p in SQL_DIR.glob(pattern))
+        assert applied == every_sql_file, (
+            f"{where} applies {pattern!r}, which misses "
+            f"{sorted(set(every_sql_file) - set(applied))}"
+        )
 
 
 def test_the_expected_files_are_all_present() -> None:
@@ -81,6 +142,8 @@ def test_the_expected_files_are_all_present() -> None:
         "08_job.sql",
         "09_claim_natural_key_condition.sql",
         "09a_hardening_catch_up.sql",
+        "11_audit_run_event.sql",
+        "12_audit_event_taxonomy.sql",
     ]
 
 
