@@ -144,7 +144,18 @@ def test_the_expected_files_are_all_present() -> None:
         "09a_hardening_catch_up.sql",
         "11_audit_run_event.sql",
         "12_audit_event_taxonomy.sql",
+        "15_claim_condition_no_default.sql",
     ]
+
+
+def test_claim_condition_has_no_default_at_creation() -> None:
+    """A-69, the create-time half. `15_claim_condition_no_default.sql` drops the
+    default on an existing database, which also masks `04` at apply time - so
+    the live suite cannot tell whether `04` itself was fixed. This can."""
+    create = _sql("04_claim.sql")
+    line = re.search(r"^\s*condition\s+jsonb[^\n]*", create, re.M)
+    assert line is not None, "04_claim.sql no longer declares `condition` where this looks"
+    assert "DEFAULT" not in line.group(0).upper(), line.group(0)
 
 
 def test_claim_natural_key_includes_condition() -> None:

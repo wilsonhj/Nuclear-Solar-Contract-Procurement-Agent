@@ -442,6 +442,50 @@ def test_restriction_can_only_increase(seeded: None) -> None:
     assert after is not None and after[0] is True
 
 
+def test_omitting_a_claims_condition_is_refused_not_defaulted(seeded: None) -> None:
+    """A-69. `condition` defaulted to `{}`, which is not how the contract spells
+    "no condition stated": `canonical_json(Condition())` is the full object with
+    every dimension null - a different jsonb value with the same grouping key.
+
+    The writer that exists stores the long form and leans on
+    `ON CONFLICT ON CONSTRAINT claim_natural_key` for idempotent re-ingest, so a
+    writer that omitted the column would have produced rows that key cannot
+    match against the slice's. With the default gone, omission is refused here,
+    at INSERT, naming the column.
+    """
+    with _connect() as conn, pytest.raises(psycopg.errors.NotNullViolation) as raised:
+        conn.execute(
+            """
+            INSERT INTO public.claim
+                (document_id, component_category, supplier, model, field,
+                 extractor_version, value, source_tier, source_ref, confidence)
+            VALUES ('open-1', 'pv_modules', 'Trina', 'TSM-700', 'nameplate_power',
+                    'v-a69', '700'::jsonb, 'system_of_record',
+                    '{"document_id":"open-1"}'::jsonb, 0.9)
+            """
+        )
+    assert raised.value.diag.column_name == "condition"
+
+
+def test_sql_15_drops_the_default_on_an_existing_database(schema: None) -> None:
+    """The catch-up path, which a greenfield apply never exercises: `04` is now
+    edited in place, so the fixture's schema never had the default to drop.
+    Put it back the way an older database has it, apply `15`, and check it is
+    gone - then apply `15` again to show it is a no-op."""
+    sql_15 = (SQL_DIR / "15_claim_condition_no_default.sql").read_text(encoding="utf-8")
+    default_sql = (
+        "SELECT column_default FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'claim' AND column_name = 'condition'"
+    )
+    with _connect() as conn:
+        conn.execute("ALTER TABLE public.claim ALTER COLUMN condition SET DEFAULT '{}'::jsonb")
+        assert conn.execute(default_sql).fetchone() == ("'{}'::jsonb",)
+        conn.execute(sql_15)
+        assert conn.execute(default_sql).fetchone() == (None,)
+        conn.execute(sql_15)
+        assert conn.execute(default_sql).fetchone() == (None,)
+
+
 def test_claims_do_not_leak_a_restricted_documents_values(seeded: None) -> None:
     """Was: no RLS on `claim`, so `SELECT document_id, field, value FROM claim`
     as `procurement_app` returned `0.19` for a document that role could not
