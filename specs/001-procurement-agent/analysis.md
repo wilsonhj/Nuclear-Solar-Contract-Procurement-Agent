@@ -1224,3 +1224,45 @@ first emitter is the right place to decide.
    sound, for the reason section 5's prohibition exists: it protects rows that *use* a value, and
    the document FK made a `web_search` row unrepresentable in every deployment. `sql/12` checks
    that no such row exists before it drops the value, and refuses with an explanation if one does.
+
+---
+
+# Round 10 — fixes ported from an unmerged branch (2026-11-21)
+
+`claude/agent-teams-dispatching-analysis-fnhewn` found several defects in August, registered them
+under IDs that later collided with this register's, and fell 103 commits behind before it could
+merge. Its findings were re-checked one by one against `main` after #50. Four did not need porting:
+the claim key already includes `condition`; dropping `audit.event.stream` would now change D-13's
+frozen preimage; adding `query_text` to `VectorStorePort` is the design D-25 explicitly rejects;
+and story 2 already specifies the deterministic context prefix it argued for. The ones still live
+are registered here, each with its own PR.
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| A-69 | **M** | **`claim.condition` defaulted to `{}`, a second spelling of "no condition stated".** `canonical_json(Condition())` — what the slice writer stores — is the full object with every dimension null; `{}` is a different jsonb value with the same `grouping_key()`. The slice's idempotent re-ingest relies on `ON CONFLICT ON CONSTRAINT claim_natural_key`, so a writer that omitted the column would write rows that key cannot match | **Fixed** — default dropped in `04` and by catch-up `15`; omission is a `NotNullViolation` |
+
+## A-69 (Medium) — the column default disagreed with the contract about "no condition"
+
+`04_claim.sql` gave `condition` a default of `{}` so that "no condition stated" would be "one value
+and not a NULL". It was one value only to the database. The contract serialises the unstated
+condition through `schema.encoding.canonical_json`, producing
+`{"base_mva":null,"basis":null,"derived":[],…}`, and jsonb equality distinguishes that from `{}`
+while `Condition.grouping_key()` does not.
+
+Nothing is broken today, because the one writer — `services/vertical_slice` — always supplies the
+column. The hazard is the second writer. The slice gets AC-5's idempotent re-ingest from
+`ON CONFLICT ON CONSTRAINT claim_natural_key DO NOTHING`, and that key compares `condition` as
+jsonb. A stage that omitted the column would insert `{}` beside the slice's long form: two rows the
+contract calls one claim, neither seen as a conflict by the key, and `ProposalError` at projection
+time the moment their values differed. The unstated condition is the commonest one.
+
+Fixed by removing the default, so omission fails at INSERT and names the column. `04` is edited in
+place and `15_claim_condition_no_default.sql` catches up existing databases, the `09a` pattern.
+Existing `{}` rows are left alone; they are history on an append-only table. The two halves are
+redundant by design — `15` alone removes the default whatever `04` says — so each is pinned
+separately: a live test of omission and of the catch-up on a database that still has the default,
+and a text check on `04`.
+
+A writer can still store a bare `{}` deliberately. No CHECK can prevent that without listing the
+condition dimensions in the DDL, which this column exists to avoid. Writers should serialise it
+with `canonical_json`, as the slice does.

@@ -54,7 +54,18 @@ CREATE TABLE public.claim (
     -- treats its own field set generically (ConditionDimensions.model_fields)
     -- rather than one column per dimension -- mirroring that here means a new
     -- condition dimension needs no migration to this table.
-    condition          jsonb NOT NULL DEFAULT '{}'::jsonb,
+    --
+    -- **NOT NULL and no DEFAULT** (A-69). This column used to default to `{}`,
+    -- which is not how the contract spells "no condition stated":
+    -- `canonical_json(Condition())` is `{"base_mva":null,"basis":null,...}`,
+    -- a different jsonb value with the same `grouping_key()`. The slice writer
+    -- stores the long form and relies on `ON CONFLICT ON CONSTRAINT
+    -- claim_natural_key` for idempotent re-ingest, so a second writer that
+    -- omitted the column would have written rows the natural key cannot match
+    -- against the slice's - silent duplicates of the commonest condition there
+    -- is. Without a default, omission fails here instead. Serialise this
+    -- column with `schema.encoding.canonical_json`, as the slice does.
+    condition          jsonb NOT NULL,
     source_tier        text NOT NULL CHECK (source_tier IN ('system_of_record', 'web_supplement')),
     -- schema.field.SourceRef, serialised whole. May itself carry a document_id
     -- different from, or absent alongside, the outer document_id column above

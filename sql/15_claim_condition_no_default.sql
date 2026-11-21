@@ -1,0 +1,24 @@
+-- Drop claim.condition's DEFAULT on databases created before 04 was edited (A-69).
+--
+-- `04_claim.sql` declared `condition jsonb NOT NULL DEFAULT '{}'::jsonb`. The
+-- contract spells "no condition stated" as `canonical_json(Condition())`, the
+-- full object with every dimension null, and `{}` is a different jsonb value
+-- with the same `grouping_key()`. The only writer today, the sanitized-PV slice,
+-- supplies the long form and relies on `ON CONFLICT ON CONSTRAINT
+-- claim_natural_key` for idempotent re-ingest (AC-5). A writer that omitted the
+-- column would have inserted `{}`, which that key cannot match against the
+-- slice's rows: a silent duplicate, and a `ProposalError` at projection time if
+-- the two values differed. Without the default, omission is a NOT NULL error at
+-- INSERT.
+--
+-- 04 is edited in place for new databases; this file catches up existing ones,
+-- the pattern 09a set. Idempotent: on a database where the default is already
+-- gone, DROP DEFAULT is a no-op. Existing `{}` rows are left as they are - they
+-- are history on an append-only table, and rewriting them would trip the
+-- append-only trigger by design.
+--
+-- Numbered 15: sql/10-14 are reserved (phase-2-execution.md), 15+ unassigned.
+--
+-- Depends on: 04_claim.sql.
+
+ALTER TABLE public.claim ALTER COLUMN condition DROP DEFAULT;
