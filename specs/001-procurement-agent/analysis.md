@@ -1124,3 +1124,103 @@ goes beyond a ratified decision, registered here so neither is chosen silently.
 |---|---|---|---|
 | A-63 | **M** | D-19 requires `section` (the heading path) on every parsed element in every format, but D-23's additive extension of `ParsedElement` lists four fields and not `section`, so the ratified interface cannot carry what D-19 promises | **Registered** — ADR-002 decision 7 adds `section` as a fifth optional field in the same PR as D-23's four |
 | A-64 | **M** | D-21 puts every request behind an OIDC session; the single-user local workspace has no identity provider to sign in to | **Registered** — ADR-002 decision 11: one fixed local principal, loopback bind only, `Origin` and `Host` checked on every request. Applies to the local workspace only, never to the reviewer surface |
+
+---
+
+# Round 9 — C4's remainder, P2-C7 (2026-11-20)
+
+`audit.run_event` (`sql/11`), the `audit.event` amendments (`sql/12`), `append_run_event`, and a
+verifier that walks both stream kinds — story 4 section A.4, built against D-13. Four findings came
+out of building it; two were defects live on `main`.
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| A-65 | **H** | **The apply-glob Track 0 was assigned never landed, and the replacement the phase-2 plan prescribes is wrong in the other direction.** All four copies — three test fixtures and the operator loop in `sql/README.md` — still read `0*.sql`, which skips `sql/10` onward. The plan's `[0-9][0-9]_*.sql` drops `09a_hardening_catch_up.sql`, and the entire live suite stays green without it | **Fixed** — `[0-9][0-9]*.sql` in all four; `test_every_apply_glob_applies_every_sql_file` holds each copy to the full directory listing; `LC_ALL=C` pinned on the shell loop; the plan's two prescriptions corrected |
+| A-66 | **H** | **An `audit.event` row could be its own parent.** `prev_hash = hash` satisfies the self-referencing FK by itself, so the INSERT-only role could plant a high-`seq` row that the writer's tip read returns, redirecting every later append | **Fixed** — `audit_event_no_self_parent` (`sql/12`); `audit.run_event` carries the same CHECK from creation |
+| A-67 | **M** | **`audit.run_event` has no row-level security, and cannot inherit any.** `audit.event` derives visibility from its document's `access_restricted`; a run event has no document. Safe for what D-13 routes there today, unsafe the moment a payload quotes document content | **Open decision** — recorded as an obligation on the emitters (story 3's query log, story 4b's `compose_override`), not enforced |
+| A-68 | **L** | **Three status statements had gone stale or contradicted their authority.** The C4 row listed `recorded_at`'s default as outstanding after `09a` dropped it; story 4's code-surface snapshot says the same; and A-49 calls removing `web_search` "an additive-only taxonomy amendment", which D-13 section 5's wording forbids | **Fixed** — C4 row updated; the `web_search` removal is justified on the ground section 5 actually protects (no row can use the value) and guarded in `sql/12` |
+
+## A-65 (High) — four copies of one glob, and the obvious fix was the wrong one
+
+**Artifacts:** `tests/test_sql_behaviour.py`, `tests/test_sql_schema.py`, `tests/test_audit_live.py`,
+`sql/README.md` · [phase-2-execution.md](phase-2-execution.md) Track 0 and P2-C6/C7
+
+The phase-2 plan assigns Track 0 to change every apply-glob to two digits "in the same PR as the
+reservation rows", before 4a writes `sql/10`–`12`. It did not land. Building P2-C7 is what
+surfaced it, and the two failure modes are not equally loud — which is the finding.
+
+- **`0*.sql`, the current value**, skips `sql/11` and `sql/12`. The live tests fail loudly on it
+  (`relation "audit.run_event" does not exist`), so CI would have caught it. The operator loop in
+  `sql/README.md` would not: it applies the files it matches and stops, and a deployment comes up
+  with no run-scoped chain and the old taxonomy.
+- **`[0-9][0-9]_*.sql`, the plan's prescription**, requires `_` as the third character and so
+  drops `09a_hardening_catch_up.sql`. **Measured: the whole live suite passes without it, 53 of
+  53.** `09a` exists to catch up databases that applied `01`–`09` before those files were hardened
+  in place; a greenfield apply already contains its effects. Nothing in the test suite can see it
+  missing. Only an operator upgrading a real database would — by not getting the hardening.
+
+`test_the_expected_files_are_all_present` could catch neither: it compares the glob's output to a
+hand-written list, so a file the glob misses is absent from both sides. The new test compares each
+copy against `sql/*.sql` instead, and was revert-checked in both directions (it names the exact file
+each wrong glob would skip). Its first version had its own defect, found by its own count check:
+results were keyed by file, so in `test_sql_schema.py` the test's *reference* glob overwrote the
+file's real one and that copy was never checked.
+
+`LC_ALL=C` is pinned on the shell loop because a shell glob sorts by the locale's collation and
+`09_` must precede `09a_`. That is a precaution, not a measured defect: the only locale available
+where this was written was `C.UTF-8`, which sorts them correctly.
+
+## A-66 (High) — a row that is its own parent
+
+`sql/07`'s chain constraints refuse a fork, a duplicate genesis, a fabricated parent, a
+disconnected root and a duplicate digest. They accepted a row whose `prev_hash` equals its own
+`hash`: the self-referencing foreign key is satisfied by the row being inserted. No foreign key can
+express "not yourself".
+
+It matters because of where such a row lands. `writer.read_chain_tip` takes
+`ORDER BY seq DESC LIMIT 1`, so a plant at a high `seq` *becomes the tip*, and every honest append
+afterwards chains off it under the advisory lock — correctly, from the writer's point of view. The
+genuine chain is orphaned behind it. `procurement_app` holds INSERT, so the least-privileged writer
+could do it.
+
+`audit.verify` would **detect** it: the walk goes in `seq` order and compares each row with the one
+before, so the plant reports as a broken link (pinned by
+`test_a_self_parented_row_is_reported_as_a_broken_link`). It does not loop. But detection happens
+after every later write has been redirected, so `sql/12` makes the row unwritable instead, and
+`sql/11` builds the run table with the same CHECK. Both live tests assert the constraint *name*,
+because the FK and the fork constraints are candidates for refusing a malformed row and only this
+one is about this row.
+
+*This is the same hole earlier work on a branch that was never merged (`claude/agent-teams-dispatching-analysis-fnhewn`) found and registered under a colliding ID. It is registered here, on this register's numbering, as the record of the fix.*
+
+## A-67 (Medium, open) — a confidential document has no way into `audit.run_event`'s visibility
+
+`audit.event` is under FORCE ROW LEVEL SECURITY, with visibility derived from the event's document.
+That is possible only because every row names one. A run event does not, so `sql/11` creates the
+table without RLS and every role granted SELECT reads every row.
+
+For what D-13 routes there that is correct: a gap-triggered web query is about public-web
+information on a supplier and model, and a `compose_override` names a human and a run. It stops
+being correct the first time a payload *quotes* a document — an override payload that lists its
+blockers by value rather than by conflict id, say. The obligation is therefore on the emitters:
+**reference documents and conflicts by id, never by value.** It is stated in `sql/11`'s header, in
+`append_run_event`'s docstring, and in the apply-order table, and it is **not enforced** anywhere.
+
+Two ways to enforce it, neither free, so neither was chosen here: an RLS policy keyed on
+`app.allow_restricted` (which would stop an uncleared composer from recording its own override, and
+the tip read would then see an empty chain and fork loudly), or a payload schema per event type
+checked in `build_run_event` (which freezes payload shapes before their first emitter exists). The
+first emitter is the right place to decide.
+
+## A-68 (Low) — three statements that had outrun the code
+
+1. `tasks.md`'s C4 row listed "removal of `recorded_at`'s stale SQL default" as remaining.
+   `09a_hardening_catch_up.sql:30` had already done it. `sql/12` repeats the statement because
+   P2-C7 assigns it there, and it is a no-op.
+2. Story 4's "code surface today" says the default is "still present". That section is a dated
+   snapshot (2026-09-03) and is left as written; this entry records that it is no longer true.
+3. A-49 says removing `web_search` from `audit.event` "is an additive-only taxonomy amendment".
+   Removal is not additive, and D-13 section 5 says removals are "forbidden". The removal is still
+   sound, for the reason section 5's prohibition exists: it protects rows that *use* a value, and
+   the document FK made a `web_search` row unrepresentable in every deployment. `sql/12` checks
+   that no such row exists before it drops the value, and refuses with an explanation if one does.

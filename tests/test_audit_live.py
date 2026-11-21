@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -42,13 +43,18 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from procurement_agent.audit import (
+    EVENT_TYPES_V1,
+    RUN_EVENT_TYPES_V1,
     DefectKind,
     append_event,
+    append_run_event,
     build_event,
     insert_event,
     lock_stream,
     read_chain_tip,
+    read_streams,
     stream_for_document,
+    stream_for_run,
     verify_stream,
 )
 from procurement_agent.audit.verify import main as verify_main
@@ -109,7 +115,7 @@ def audit_schema() -> None:
         conn.execute("DROP SCHEMA IF EXISTS public CASCADE")
         conn.execute("CREATE SCHEMA public")
         conn.execute("GRANT USAGE, CREATE ON SCHEMA public TO PUBLIC")
-        for path in sorted(SQL_DIR.glob("0*.sql")):
+        for path in sorted(SQL_DIR.glob("[0-9][0-9]*.sql")):
             conn.execute(path.read_text(encoding="utf-8"))
         conn.execute(
             """
@@ -601,3 +607,255 @@ def test_a_the_cli_exits_nonzero_on_a_tampered_chain(
     finally:
         os.environ.pop("PROCUREMENT_DATABASE_URL", None)
     assert "hash_mismatch" in capsys.readouterr().out
+
+
+# --- P2-C7: audit.run_event (sql/11) and the audit.event amendments (sql/12) ------
+
+RUN_ID = "run-c4-live"
+RUN_STREAM = stream_for_run(RUN_ID)
+
+
+def _clear_run_events() -> None:
+    with _connect() as conn:
+        conn.execute("ALTER TABLE audit.run_event DISABLE TRIGGER audit_run_event_no_mutation")
+        conn.execute("DELETE FROM audit.run_event")
+        conn.execute("ALTER TABLE audit.run_event ENABLE TRIGGER audit_run_event_no_mutation")
+
+
+@pytest.fixture
+def empty_run_chain(audit_schema: None) -> Any:
+    """An empty `audit.run_event`, before and after - `empty_chain`'s twin."""
+    _clear_run_events()
+    yield
+    _clear_run_events()
+
+
+def _live_check_values(table: str, constraint: str) -> frozenset[str]:
+    """The CHECK as the server holds it - the authority the file-reading parity
+    test in `test_audit_envelope.py` approximates."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = %s::regclass AND conname = %s",
+            (table, constraint),
+        ).fetchone()
+    assert row is not None, f"{table} has no constraint {constraint}"
+    return frozenset(re.findall(r"'([a-z_]+)'::text", str(row[0])))
+
+
+def test_run_event_chain_verifies(empty_run_chain: None) -> None:
+    """Story 4 section A.4, by name. Appended through `append_run_event` in one
+    transaction - the path every run-scoped emitter takes - committed, read back
+    and walked by the same verifier as document chains."""
+    with _connect(autocommit=False) as conn:
+        for event_type in ("run_started", "web_search", "compose_override", "run_finished"):
+            append_run_event(
+                conn,
+                run_id=RUN_ID,
+                event_type=event_type,
+                actor="runner",
+                payload={"step": event_type},
+                recorded_at=datetime.now(UTC),
+            )
+        conn.commit()
+
+    with _connect() as conn:
+        report = verify_stream(conn, RUN_STREAM)
+        assert RUN_STREAM in read_streams(conn), "the verifier does not discover run chains"
+    assert report.ok, report.defects
+    assert report.events == 4
+
+
+def test_the_cli_verifies_run_chains_it_discovers(
+    empty_run_chain: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no `--stream`, the CLI walks every stream in *both* tables. A run
+    chain the CLI never found would be a chain nobody ever verifies."""
+    with _connect(autocommit=False) as conn:
+        append_run_event(
+            conn,
+            run_id=RUN_ID,
+            event_type="run_started",
+            actor="runner",
+            payload={},
+            recorded_at=datetime.now(UTC),
+        )
+        conn.commit()
+    assert DSN is not None
+    os.environ["PROCUREMENT_DATABASE_URL"] = DSN
+    try:
+        assert verify_main([]) == 0
+    finally:
+        os.environ.pop("PROCUREMENT_DATABASE_URL", None)
+    assert f"{RUN_STREAM}: OK (1 events)" in capsys.readouterr().out
+
+
+def test_eight_concurrent_run_writers_produce_no_forks(empty_run_chain: None) -> None:
+    """Decision 9's measurement, repeated on the run chain: eight writers, one
+    run, each append its own transaction. `append_run_event` takes the same
+    lock as its own statement, so the chain must come out linear and verify."""
+    barrier = threading.Barrier(WRITERS)
+    failures: list[str] = []
+
+    def writer(worker: int) -> None:
+        with _connect(autocommit=False) as conn:
+            barrier.wait()
+            for index in range(EVENTS_PER_WRITER):
+                try:
+                    append_run_event(
+                        conn,
+                        run_id=RUN_ID,
+                        event_type="web_search",
+                        actor=f"worker-{worker}",
+                        payload={"w": worker, "i": index},
+                        recorded_at=datetime.now(UTC),
+                    )
+                    conn.commit()
+                except psycopg.errors.Error as exc:  # noqa: PERF203
+                    conn.rollback()
+                    failures.append(type(exc).__name__)
+
+    with ThreadPoolExecutor(max_workers=WRITERS) as pool:
+        list(pool.map(writer, range(WRITERS)))
+
+    assert failures == []
+    with _connect() as conn:
+        report = verify_stream(conn, RUN_STREAM)
+    assert report.ok, report.defects
+    assert report.events == WRITERS * EVENTS_PER_WRITER
+
+
+def test_event_table_refuses_web_search_after_12(audit_schema: None) -> None:
+    """Story 4 section A.4, by name: `sql/12` removed the value from
+    `audit.event`, which could never store it (A-49)."""
+    with _connect() as conn, pytest.raises(psycopg.errors.CheckViolation) as raised:
+        conn.execute(
+            """
+            INSERT INTO audit.event (stream, document_id, seq, prev_hash, hash, event_type,
+                                     actor, payload_canonical, recorded_at)
+            VALUES (%s, %s, 0, NULL, %s, 'web_search', 'x', '{}', now())
+            """,
+            (STREAM, DOCUMENT_ID, bytes(32)),
+        )
+    assert raised.value.diag.constraint_name == "audit_event_event_type_check"
+
+
+def test_recorded_at_has_no_default_after_12(audit_schema: None) -> None:
+    """Story 4 section A.4, by name, for both tables. D-13 section 4: the caller
+    supplies and hashes it, so a default could only ever record a timestamp the
+    chain cannot verify."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT table_name, column_default FROM information_schema.columns "
+            "WHERE table_schema = 'audit' AND column_name = 'recorded_at' ORDER BY 1"
+        ).fetchall()
+    assert rows == [("event", None), ("run_event", None)]
+
+
+def test_the_live_checks_equal_the_python_taxonomies(audit_schema: None) -> None:
+    """The server's CHECKs, not the files', against the library's constants."""
+    assert _live_check_values("audit.event", "audit_event_event_type_check") == EVENT_TYPES_V1
+    assert _live_check_values("audit.run_event", "run_event_event_type_check") == (
+        RUN_EVENT_TYPES_V1
+    )
+
+
+@pytest.mark.parametrize(
+    ("table", "stream", "key_column", "key", "event_type", "constraint"),
+    [
+        (
+            "audit.event",
+            STREAM,
+            "document_id",
+            DOCUMENT_ID,
+            "extraction",
+            "audit_event_no_self_parent",
+        ),
+        (
+            "audit.run_event",
+            RUN_STREAM,
+            "run_id",
+            RUN_ID,
+            "run_started",
+            "audit_run_event_no_self_parent",
+        ),
+    ],
+)
+def test_an_event_cannot_be_its_own_parent(
+    empty_chain: None,
+    empty_run_chain: None,
+    table: str,
+    stream: str,
+    key_column: str,
+    key: str,
+    event_type: str,
+    constraint: str,
+) -> None:
+    """Was: accepted, on `audit.event`. A row whose `prev_hash` is its own `hash`
+    satisfies the self-referencing FK by itself, so every constraint passed.
+    Planted at a high `seq` it becomes what the writer's tip read returns, and
+    every honest append afterwards chains off it.
+
+    The constraint name is asserted, not just the error class: the FK and the
+    fork constraints are both candidates for refusing a malformed row, and only
+    this one is about *this* row.
+    """
+    planted = bytes.fromhex("7f" * 32)
+    query = (
+        f"INSERT INTO {table} (stream, {key_column}, seq, prev_hash, hash, event_type, "  # noqa: S608
+        "actor, payload_canonical, recorded_at) VALUES (%s, %s, 5000, %s, %s, %s, 'x', '{}', now())"
+    )
+    with _connect() as conn, pytest.raises(psycopg.errors.CheckViolation) as raised:
+        conn.execute(query, (stream, key, planted, planted, event_type))
+    assert raised.value.diag.constraint_name == constraint
+
+
+def test_run_events_are_append_only(empty_run_chain: None) -> None:
+    """Privilege separation is the boundary (Decision 9) and the triggers are
+    the tripwire - both checked, since `sql/11` writes both.
+
+    The tripwire message must name *this* table. `sql/11` generalised the two
+    trigger functions `sql/07` wrote with `audit.event` hardcoded in the text;
+    attached as they were, a rejected run-event mutation reported the wrong
+    table.
+    """
+    with _connect(autocommit=False) as conn:
+        append_run_event(
+            conn,
+            run_id=RUN_ID,
+            event_type="run_started",
+            actor="runner",
+            payload={},
+            recorded_at=datetime.now(UTC),
+        )
+        conn.commit()
+
+    with _connect() as conn:
+        for role in ("procurement_app", "procurement_ingest"):
+            for privilege in ("UPDATE", "DELETE", "TRUNCATE"):
+                row = conn.execute(
+                    "SELECT has_table_privilege(%s, 'audit.run_event', %s)", (role, privilege)
+                ).fetchone()
+                assert row == (False,), f"{role} holds {privilege} on audit.run_event"
+            row = conn.execute(
+                "SELECT has_table_privilege(%s, 'audit.run_event', 'INSERT')", (role,)
+            ).fetchone()
+            assert row == (True,), f"{role} cannot INSERT run events"
+
+        with pytest.raises(psycopg.errors.RaiseException, match=r"audit\.run_event is append-only"):
+            conn.execute("UPDATE audit.run_event SET actor = 'someone-else'")
+        with pytest.raises(psycopg.errors.RaiseException, match=r"audit\.run_event is append-only"):
+            conn.execute("TRUNCATE audit.run_event")
+        with pytest.raises(psycopg.errors.RaiseException, match=r"audit\.event is append-only"):
+            conn.execute("TRUNCATE audit.event")
+
+
+def test_sql_12_reapplies_as_a_no_op(audit_schema: None) -> None:
+    """Forward-only and idempotent, as `09a` is: an operator re-running the
+    apply loop over an up-to-date database must change nothing and fail
+    nowhere."""
+    with _connect() as conn:
+        before = _live_check_values("audit.event", "audit_event_event_type_check")
+        conn.execute((SQL_DIR / "12_audit_event_taxonomy.sql").read_text(encoding="utf-8"))
+        after = _live_check_values("audit.event", "audit_event_event_type_check")
+    assert before == after == EVENT_TYPES_V1

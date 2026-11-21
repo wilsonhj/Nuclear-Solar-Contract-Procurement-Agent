@@ -23,23 +23,29 @@ import pathlib
 import re
 import types
 from datetime import UTC, datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
 from procurement_agent.audit import (
     ENVELOPE_VERSION,
     EVENT_TYPES_V1,
+    RUN_EVENT_TYPES_V1,
     AuditEvent,
     ChainTip,
     JsonObject,
     UnknownEventTypeError,
     build_event,
     build_preimage,
+    build_run_event,
     canonical_text,
     digest_of,
     document_id_for_stream,
     format_recorded_at,
+    run_id_for_stream,
     stream_for_document,
+    stream_for_run,
+    taxonomy_for_stream,
 )
 from procurement_agent.schema.encoding import encode_value
 
@@ -268,32 +274,214 @@ def test_a_recorded_at_agrees_with_the_d14_encoder() -> None:
 # --- D-13 section 5: the v1 taxonomy -------------------------------------------
 
 
-def _ddl_event_types() -> frozenset[str]:
-    """The `event_type` CHECK's values, read out of `sql/07_audit_event.sql`.
+_SQL_DIR = pathlib.Path(__file__).parent.parent / "sql"
 
-    Read rather than restated so the Python constant cannot drift from the
-    constraint that actually rejects a bad INSERT. This test owns no part of
-    `sql/`; it only refuses to let the two disagree in silence.
+
+def _ddl_event_types(table: str) -> frozenset[str]:
+    """The `event_type` CHECK values `table` has **after every file is applied**.
+
+    Read rather than restated, so the Python constant cannot drift from the
+    constraint that actually rejects a bad INSERT. And read in apply order,
+    taking the *last* definition: this used to read `sql/07` alone, which after
+    `sql/12` (P2-C7) describes a constraint that no longer exists - the test
+    would have held the library equal to dead text and passed while the live
+    CHECK disagreed. `test_sql_*`'s live counterpart compares against
+    `pg_get_constraintdef` itself.
     """
-    ddl = (pathlib.Path(__file__).parent.parent / "sql" / "07_audit_event.sql").read_text(
-        encoding="utf-8"
+    inline = re.compile(
+        rf"CREATE TABLE {re.escape(table)} \(.*?event_type\s+text NOT NULL CHECK "
+        r"\(event_type IN \((.*?)\)\)",
+        re.S,
     )
-    match = re.search(r"event_type\s+text NOT NULL CHECK \(event_type IN \((.*?)\)\)", ddl, re.S)
-    assert match is not None, "the event_type CHECK is no longer where this test looks for it"
-    return frozenset(re.findall(r"'([a-z_]+)'", match.group(1)))
+    altered = re.compile(
+        rf"ALTER TABLE {re.escape(table)} ADD CONSTRAINT \w+ CHECK \(event_type IN \((.*?)\)\)",
+        re.S,
+    )
+    found: str | None = None
+    for path in sorted(_SQL_DIR.glob("[0-9][0-9]*.sql")):
+        text = path.read_text(encoding="utf-8")
+        for pattern in (inline, altered):
+            for match in pattern.finditer(text):
+                found = match.group(1)
+    assert found is not None, f"no event_type CHECK for {table} where this test looks"
+    return frozenset(re.findall(r"'([a-z_]+)'", found))
 
 
 def test_a_the_v1_taxonomy_matches_the_ddl_exactly() -> None:
-    """D-13 section 5: the seven values are version 1, additive-only.
+    """D-13 section 5: additive-only, and two constants naming one taxonomy is a
+    drift waiting to happen.
 
-    Two constants naming one taxonomy is a drift waiting to happen, and drift in
-    the *removing* direction is what a chain cannot tolerate. Equality, not
-    containment: a value the library would emit but the CHECK would reject is a
-    runtime failure, and a value the CHECK allows but the library refuses to
-    build is an event nobody can write.
+    Equality, not containment: a value the library would emit but the CHECK
+    would reject is a runtime failure, and a value the CHECK allows but the
+    library refuses to build is an event nobody can write.
+
+    Six, not seven, since `sql/12` (P2-C7): `web_search` left `audit.event`,
+    which could never store it (A-49), for `audit.run_event`.
     """
-    assert EVENT_TYPES_V1 == _ddl_event_types()
-    assert len(EVENT_TYPES_V1) == 7
+    assert _ddl_event_types("audit.event") == EVENT_TYPES_V1
+    assert len(EVENT_TYPES_V1) == 6
+    assert "web_search" not in EVENT_TYPES_V1
+
+
+def test_the_run_taxonomy_matches_its_ddl_exactly() -> None:
+    """The same equality for `audit.run_event` (`sql/11`), for the same reason."""
+    assert _ddl_event_types("audit.run_event") == RUN_EVENT_TYPES_V1
+    assert RUN_EVENT_TYPES_V1 == {"web_search", "compose_override", "run_started", "run_finished"}
+
+
+def test_the_two_taxonomies_are_disjoint() -> None:
+    """A type legal in both tables would make the stream prefix, rather than the
+    type, the only thing saying where an event belongs - and `taxonomy_for_stream`
+    exists so the verifier can flag a type in the wrong chain."""
+    assert not (EVENT_TYPES_V1 & RUN_EVENT_TYPES_V1)
+
+
+# --- run-scoped events (P2-C7) ----------------------------------------------------
+
+RUN_ID = "run-2026-11-20-a"
+
+
+def _independent_digest(stream: str, *, event_type: str, prev_hash: bytes | None) -> str:
+    """D-13 section 2's digest, computed without touching `audit.envelope`.
+
+    `rfc8785` and `hashlib` directly, on a literal dict. If `build_run_event`
+    and this disagree, the envelope is not the one D-13 specifies - which is a
+    stronger statement than "it agrees with `build_preimage`", since that is
+    the function under test.
+    """
+    import hashlib
+
+    import rfc8785
+
+    preimage: dict[str, Any] = {
+        "v": 1,
+        "stream": stream,
+        "seq": 0 if prev_hash is None else 1,
+        "event_type": event_type,
+        "actor": ACTOR,
+        "recorded_at": "2026-08-06T15:04:05.000000Z",
+        "prev_hash": None if prev_hash is None else prev_hash.hex(),
+        "payload": dict(PAYLOAD),
+    }
+    return hashlib.sha256(rfc8785.dumps(preimage)).hexdigest()
+
+
+def test_a_run_event_is_sealed_with_d13s_envelope_verbatim() -> None:
+    """D-13: run events reuse "WP-H's envelope and lock discipline verbatim".
+
+    Checked against an independent computation rather than against
+    `build_preimage`, for both a genesis and a child: the stream string is the
+    only input that differs from a document event, and the digest must be
+    exactly what D-13 section 2 says for that stream.
+    """
+    genesis = build_run_event(
+        run_id=RUN_ID,
+        event_type="run_started",
+        actor=ACTOR,
+        payload=PAYLOAD,
+        recorded_at=RECORDED_AT,
+        tip=None,
+    )
+    assert genesis.stream == f"run:{RUN_ID}"
+    assert (genesis.seq, genesis.prev_hash) == (0, None)
+    assert genesis.hash.hex() == _independent_digest(
+        genesis.stream, event_type="run_started", prev_hash=None
+    )
+
+    child = build_run_event(
+        run_id=RUN_ID,
+        event_type="compose_override",
+        actor=ACTOR,
+        payload=PAYLOAD,
+        recorded_at=RECORDED_AT,
+        tip=ChainTip(seq=0, hash=PARENT),
+    )
+    assert (child.seq, child.prev_hash) == (1, PARENT)
+    assert child.hash.hex() == _independent_digest(
+        child.stream, event_type="compose_override", prev_hash=PARENT
+    )
+
+
+def test_the_stream_is_hashed_so_a_run_event_cannot_pass_as_a_document_event() -> None:
+    """Domain separation comes from the stream being *inside* the preimage.
+
+    The same type, actor, payload, instant and parent under `doc:x` and `run:x`
+    must digest differently - otherwise a row could be lifted from one table into
+    the other and still verify. Uses `build_preimage` for the document side
+    because no document-scoped type is also run-scoped; the property is about
+    the stream field, not the type.
+    """
+    run = build_run_event(
+        run_id="x",
+        event_type="run_started",
+        actor=ACTOR,
+        payload=PAYLOAD,
+        recorded_at=RECORDED_AT,
+        tip=None,
+    )
+    as_document = digest_of(
+        build_preimage(
+            version=ENVELOPE_VERSION,
+            stream="doc:x",
+            seq=0,
+            event_type="run_started",
+            actor=ACTOR,
+            recorded_at=format_recorded_at(RECORDED_AT),
+            prev_hash=None,
+            payload=PAYLOAD,
+        )
+    )
+    assert run.hash != as_document
+
+
+def test_each_builder_refuses_the_other_tables_types() -> None:
+    """A document type in a run chain, or a run type in a document chain, is
+    refused in Python before either CHECK sees it - with a message naming the
+    file that owns the taxonomy."""
+    with pytest.raises(UnknownEventTypeError, match="sql/11"):
+        build_run_event(
+            run_id=RUN_ID,
+            event_type="extraction",
+            actor=ACTOR,
+            payload=PAYLOAD,
+            recorded_at=RECORDED_AT,
+            tip=None,
+        )
+    with pytest.raises(UnknownEventTypeError, match="sql/12"):
+        build_event(
+            document_id=DOCUMENT_ID,
+            event_type="compose_override",
+            actor=ACTOR,
+            payload=PAYLOAD,
+            recorded_at=RECORDED_AT,
+            tip=None,
+        )
+    with pytest.raises(UnknownEventTypeError):
+        build_event(
+            document_id=DOCUMENT_ID,
+            event_type="web_search",
+            actor=ACTOR,
+            payload=PAYLOAD,
+            recorded_at=RECORDED_AT,
+            tip=None,
+        )
+
+
+def test_run_streams_round_trip_and_refuse_an_empty_id() -> None:
+    assert run_id_for_stream(stream_for_run(RUN_ID)) == RUN_ID
+    with pytest.raises(ValueError, match="names no run"):
+        stream_for_run("")
+    for bad in ("run:", "doc:x", "global", ""):
+        with pytest.raises(ValueError):
+            run_id_for_stream(bad)
+
+
+def test_the_stream_prefix_alone_selects_the_taxonomy() -> None:
+    assert taxonomy_for_stream("doc:a") == EVENT_TYPES_V1
+    assert taxonomy_for_stream("run:a") == RUN_EVENT_TYPES_V1
+    for bad in ("doc:", "run:", "global", "", "DOC:a"):
+        with pytest.raises(ValueError):
+            taxonomy_for_stream(bad)
 
 
 def test_a_an_unknown_event_type_is_refused_before_the_insert() -> None:

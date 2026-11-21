@@ -70,12 +70,12 @@ from typing import Any
 
 from .canonical import CanonicalisationError, JsonObject, canonical_text
 from .envelope import (
-    EVENT_TYPES_V1,
     KNOWN_ENVELOPE_VERSIONS,
+    RUN_STREAM_PREFIX,
     build_preimage,
     digest_of,
-    document_id_for_stream,
     format_recorded_at,
+    taxonomy_for_stream,
 )
 from .writer import AuditConnection
 
@@ -109,6 +109,7 @@ class DefectKind(StrEnum):
     PAYLOAD_NOT_CANONICAL = "payload_not_canonical"
     PAYLOAD_NOT_REPRESENTABLE = "payload_not_representable"
     DIGEST_NOT_RECOMPUTABLE = "digest_not_recomputable"
+    UNKNOWN_STREAM = "unknown_stream"
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,18 +181,36 @@ def verify_events(stream: str, rows: Sequence[StoredEvent]) -> ChainReport:
     """
     defects: list[ChainDefect] = []
     previous: StoredEvent | None = None
+    ordered = sorted(rows, key=lambda event: event.seq)
 
-    for row in sorted(rows, key=lambda event: event.seq):
+    # The stream's prefix decides its taxonomy: a document chain holding
+    # `compose_override`, or a run chain holding `extraction`, is a defect even
+    # though each type is legal in the other table (P2-C7). A stream that is
+    # neither kind is reported once and its rows still walked - this function
+    # does not raise, for the reason the docstring gives.
+    try:
+        taxonomy = taxonomy_for_stream(stream)
+    except ValueError as exc:
+        taxonomy = frozenset()
+        if ordered:
+            defects.append(
+                ChainDefect(
+                    DefectKind.UNKNOWN_STREAM, ordered[0].seq, ordered[0].event_id, str(exc)
+                )
+            )
+
+    for row in ordered:
         payload = _check_payload(row, defects)
 
-        if row.event_type not in EVENT_TYPES_V1:
+        if taxonomy and row.event_type not in taxonomy:
             defects.append(
                 ChainDefect(
                     DefectKind.UNKNOWN_EVENT_TYPE,
                     row.seq,
                     row.event_id,
-                    f"{row.event_type!r} is not in C4's v1 taxonomy; either the CHECK was "
-                    "widened without amending D-13, or a value was removed",
+                    f"{row.event_type!r} is not in this stream's C4 v1 taxonomy "
+                    f"({', '.join(sorted(taxonomy))}); either a CHECK was widened without "
+                    "amending D-13, a value was removed, or the row is in the wrong table",
                 )
             )
 
@@ -408,11 +427,22 @@ def _hex(value: bytes | None) -> str:
 
 # --- reading rows --------------------------------------------------------------
 
-_STREAMS_SQL = "SELECT DISTINCT stream FROM audit.event ORDER BY stream"
+#: Every stream in both chains (P2-C7). A stream name belongs to exactly one
+#: table by its prefix, so this is a plain distinct union.
+_STREAMS_SQL = (
+    "SELECT DISTINCT stream FROM "
+    "(SELECT stream FROM audit.event UNION ALL SELECT stream FROM audit.run_event) AS s "
+    "ORDER BY stream"
+)
 
 _EVENTS_SQL = """
 SELECT event_id, seq, prev_hash, hash, event_type, actor, payload_canonical, recorded_at
   FROM audit.event WHERE stream = %s ORDER BY seq
+"""
+
+_RUN_EVENTS_SQL = """
+SELECT event_id, seq, prev_hash, hash, event_type, actor, payload_canonical, recorded_at
+  FROM audit.run_event WHERE stream = %s ORDER BY seq
 """
 
 
@@ -422,7 +452,14 @@ def read_streams(conn: AuditConnection) -> list[str]:
 
 
 def read_events(conn: AuditConnection, stream: str) -> list[StoredEvent]:
-    cursor = conn.execute(_EVENTS_SQL, (stream,))
+    """Rows of one chain, from whichever table its prefix names.
+
+    `event_id` is per table, so a run chain's ids can coincide with a document
+    chain's. That is harmless: a report is always about one stream, and the
+    stream says which table the id is in.
+    """
+    query = _RUN_EVENTS_SQL if stream.startswith(RUN_STREAM_PREFIX) else _EVENTS_SQL
+    cursor = conn.execute(query, (stream,))
     return [
         StoredEvent(
             event_id=int(row[0]),
@@ -469,7 +506,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(
         prog="python -m procurement_agent.audit",
-        description="Verify the audit.event hash chains (WP-H H.5, contract C4).",
+        description=(
+            "Verify the audit.event and audit.run_event hash chains (WP-H H.5, contract C4)."
+        ),
     )
     parser.add_argument(
         "--dsn",
@@ -480,7 +519,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--stream",
         action="append",
         dest="streams",
-        metavar="doc:ID",
+        metavar="doc:ID|run:ID",
         help="Verify only this stream. Repeatable. Defaults to every stream present.",
     )
     args = parser.parse_args(argv)
@@ -504,7 +543,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # before connecting, so the answer does not depend on reaching a server.
     for stream in args.streams or ():
         try:
-            document_id_for_stream(stream)
+            taxonomy_for_stream(stream)
         except ValueError as exc:
             print(exc)
             return 2
@@ -548,8 +587,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         #
         # The prefix check above says a stream that cannot exist "would otherwise
         # return zero rows and report OK, which is the one output an operator
-        # must never get from a typo" - but `document_id_for_stream` validates
-        # only the `doc:` prefix, and document ids are UUIDs. The realistic typo
+        # must never get from a typo" - but `taxonomy_for_stream` validates
+        # only the `doc:` or `run:` prefix, and ids are UUIDs. The realistic typo
         # is *inside* the id, which passes the prefix check and lands in exactly
         # the state the comment forbids. A cron pinned to one document reported
         # success forever.

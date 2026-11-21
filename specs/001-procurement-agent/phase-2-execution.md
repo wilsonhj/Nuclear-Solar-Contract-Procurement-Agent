@@ -64,7 +64,7 @@ artifact dependency, not a scheduling preference. Merge ordering is stated below
 `15+` unassigned (P2-A-21). **The apply glob must match those names.** Today's `sql/0*.sql` (and
 the same glob in `tests/test_sql_schema.py`, `tests/test_sql_behaviour.py`, `tests/test_audit_live.py`)
 does **not** match `10_*.sql`. Track 0 changes every copy to a two-digit glob
-(`[0-9][0-9]_*.sql` or equivalent) in the same PR as the reservation rows. Track 0 does **not**
+(`[0-9][0-9]*.sql` — **not** `[0-9][0-9]_*.sql`, which needs `_` as the third character and so drops `09a_hardening_catch_up.sql`; [A-65](analysis.md)) in the same PR as the reservation rows. Track 0 does **not**
 write `sql/10`–`14`; 4a and 7 do. Until those files exist the glob change is a no-op on the
 `00`–`09` set.
 
@@ -135,7 +135,7 @@ fine; removing one is a spec change. Named:
 - **P2-C3** `test_lexical_search_port_none_allowlist_returns_nothing` — seventh Protocol; in-memory reference + capability row; `allowed_document_ids=None` → `[]`
 - **P2-C4** `test_web_hit_has_no_snippet_or_rank` — eighth Protocol; in-memory reference; fields `url`, `title`, `retrieved_at`, `provider` only
 - **P2-C5** `test_principal_context_is_the_schema_type` — imported from `procurement_agent.schema`; a grep pin asserts the class body is not duplicated under `services/`
-- **P2-C6 / P2-C7** `test_sql_readme_reserves_10_through_14`; `test_sql_apply_glob_is_two_digit` — `[0-9][0-9]_*.sql` (or equivalent matching `10_`…`14_`) in `sql/README.md` and the three test globs. `test_the_expected_files_are_all_present` still lists `00`–`09` until 4a/7 add files. Track 0 does **not** write `sql/10`–`12`
+- **P2-C6 / P2-C7** `test_sql_readme_reserves_10_through_14`; `test_sql_apply_glob_is_two_digit` — `[0-9][0-9]*.sql` (it must match `09a_` as well as `10_`…`14_`; landed as `test_every_apply_glob_applies_every_sql_file`, which holds every copy to the full directory listing, A-65) in `sql/README.md` and the three test globs. `test_the_expected_files_are_all_present` still lists `00`–`09` until 4a/7 add files. Track 0 does **not** write `sql/10`–`12`
 - **P2-C8** `test_extractor_version_prefixes` — the four prefixes are pinned (constant or docstring test); no claim writes
 - **P2-C9** `test_fieldspec_has_optional_web_query_template` — annotation `str | None`, default `None`; no second query-key type
 - **P2-A-8** `docs/current-state.md` baseline is the post-#36 count (1039 passed / 42 skipped / 4 xfailed)
