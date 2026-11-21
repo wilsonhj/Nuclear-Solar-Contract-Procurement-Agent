@@ -236,6 +236,26 @@ def test_printed_synonyms_fold_to_their_member() -> None:
         assert Condition(weighting=printed).weighting is EfficiencyWeighting.EUROPEAN  # type: ignore[arg-type]
 
 
+def test_the_spellings_the_alias_comment_cites_are_tested_literally() -> None:
+    """A-70. The test above and the alias table both justify themselves with
+    two printed forms - "Euro efficiency" and "ANSI/IEEE (C57.12.00 5.4)" - and
+    neither test asserted either one, which is how both stayed rejected.
+
+    One is now an alias. The other is pinned as refused, with the reason: a
+    parenthetical-stripping rule that accepted it would also accept
+    "IEC (draft)", where the parenthetical is the meaning. If an extractor
+    change makes it safe to accept, delete that half of this test alongside it.
+    """
+    for printed in ("Euro efficiency", "European efficiency", "EURO EFFICIENCY", "euro-efficiency"):
+        assert (
+            Condition(weighting=printed).weighting  # type: ignore[arg-type]
+            is EfficiencyWeighting.EUROPEAN
+        ), printed
+    for citation_bearing in ("ANSI/IEEE (C57.12.00 5.4)", "IEC (draft)", "IEC (superseded)"):
+        with pytest.raises(ValidationError):
+            Condition(standards_regime=citation_bearing)  # type: ignore[arg-type]
+
+
 def test_the_printed_spacing_of_a_member_is_not_a_validation_failure() -> None:
     """No datasheet prints `full_power`; they print "Full power". Folding hyphens
     but not spaces split the difference in the direction that drops documents —

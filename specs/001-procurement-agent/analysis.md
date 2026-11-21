@@ -1224,3 +1224,36 @@ first emitter is the right place to decide.
    sound, for the reason section 5's prohibition exists: it protects rows that *use* a value, and
    the document FK made a `web_search` row unrepresentable in every deployment. `sql/12` checks
    that no such row exists before it drops the value, and refuses with an explanation if one does.
+
+---
+
+# Round 10 — fixes ported from an unmerged branch (2026-11-21)
+
+*A-69 is in the companion PR that opens this round; whichever of the two merges second folds its row
+into one table.*
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| A-70 | **M** | **`VOCABULARY_ALIASES` refused both printed spellings its own comment cites as the reason it exists.** "Euro efficiency" folded to `euro_efficiency`, which the table lacked; "ANSI/IEEE (C57.12.00 5.4)" matched nothing. The test whose docstring quotes both asserted neither | **Fixed** for "Euro efficiency"; the clause-bearing form is **deliberately still refused**, and pinned as such |
+
+## A-70 (Medium) — the alias table's own examples were the ones it dropped
+
+The alias table exists because "closing the vocabularies turned every unlisted spelling into a hard
+validation failure", and rejecting a real spelling drops the document. It justifies that with two
+printed forms. Both raised `ValidationError`:
+
+- `Condition(weighting="Euro efficiency")` folds to `euro_efficiency`; the table carried only bare
+  `euro`. Now aliased, with `european_efficiency`. It is a fixed industry term for the European
+  weighting, so folding it asserts nothing the datasheet does not say. Existing data is unaffected:
+  these inputs used to raise, so no stored grouping key changes.
+- `Condition(standards_regime="ANSI/IEEE (C57.12.00 5.4)")` folds to
+  `ansi/ieee_(c57.12.00_5.4)`. **Left refused.** A rule that strips a trailing parenthetical would
+  accept it, and on the branch this came from one was written and reverted when a test in the same
+  pass showed it also accepting `IEC (but not really)` — so `IEC (draft)` and `IEC (superseded)`
+  too, where the parenthetical is the meaning. Nothing textual separates a citation from a
+  qualifier, and a wrong regime picks the wrong multi-cooling rating without saying so. The
+  extractor should emit the regime and the clause citation as separate fields.
+
+`test_printed_synonyms_fold_to_their_member` quotes both spellings in its docstring and tested
+neither; `test_the_spellings_the_alias_comment_cites_are_tested_literally` now asserts both
+outcomes. Removing the alias reds exactly that test.

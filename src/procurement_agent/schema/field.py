@@ -590,12 +590,26 @@ CONDITION_DIMENSION_NAMES: frozenset[str] = frozenset(ConditionDimensions.model_
 #: *derived* from one regime rather than names for it, and asserting which would
 #: be a technical claim about a standard nobody here has read - see
 #: open-decisions.md.
+#:
+#: **Both printed forms quoted above were themselves rejected until A-70.**
+#: "Euro efficiency" folds to `euro_efficiency`, and only bare `euro` was here.
+#: That one is closed below: it is a fixed industry term for the European
+#: weighting, so folding it asserts nothing the datasheet does not. "ANSI/IEEE
+#: (C57.12.00 5.4)" folds to `ansi/ieee_(c57.12.00_5.4)` and is **deliberately
+#: still refused**. Stripping a trailing parenthetical would resolve it, and
+#: would equally resolve "IEC (draft)" or "IEC (superseded)", where the
+#: parenthetical is what carries the meaning. Nothing in the text separates a
+#: citation from a qualifier, and a wrong regime picks the wrong multi-cooling
+#: rating silently. The extractor should emit the regime and the clause
+#: citation separately; the citation belongs in `note` or the SourceRef span.
 VOCABULARY_ALIASES: dict[str, str] = {
     "ansi": "ieee",
     "ansi/ieee": "ieee",
     "ieee/ansi": "ieee",
     "euro": "european",
     "eu": "european",
+    "euro_efficiency": "european",
+    "european_efficiency": "european",
 }
 
 #: Characters PDF and XLSX extraction inserts that carry no meaning. `str.strip`
